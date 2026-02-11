@@ -1,0 +1,28 @@
+files_root: .
+vlnv: ::wb_inctercon:0
+parameters: 
+  masters:
+    io: 
+      slaves : [rom, sys, ptc, gpio, gpio2, rgb, uart]
+  slaves: 
+    rom: 
+      offset: 0x00000000
+      size: 0x00001000
+    sys:
+      offset: 0x00001000
+      size: 0x00000040
+    ptc: 
+      offset: 0x00001200
+      size: 0x00000040
+    gpio:
+      offset: 0x00001400
+      size: 0x00000040
+    gpio2: 
+      offset: 0x00001800
+      size: 0x00000040
+    rgb: 
+      offset: 0x00001C00
+      size: 0x00000040
+    uart:
+      offset: 0x00002000
+      size: 0x00001000
