@@ -97,6 +97,13 @@ module veerwolf_core
     inout wire [2:0]   o_rgb1,   // On-board color RGB LEDs
 `endif
 
+    // HDMI signals
+    input wire         clk_hdmi,     // 125 MHz HDMI clock
+    output wire        hdmi_clk_n,   // HDMI differential clock negative
+    output wire        hdmi_clk_p,   // HDMI differential clock positive
+    output wire [2:0]  hdmi_tx_n,    // HDMI differential data negative
+    output wire [2:0]  hdmi_tx_p,    // HDMI differential data positive
+
     input wire  clk,
     input wire         rstn,
     input wire         dmi_reg_en,

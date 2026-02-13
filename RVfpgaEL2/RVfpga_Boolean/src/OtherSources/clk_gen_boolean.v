@@ -24,7 +24,8 @@
 module clk_gen_boolean
   (input  wire i_clk,
    input  wire     i_rst,
-   output wire     o_clk_core,
+   output wire     o_clk_core,  // 25 MHz
+   output wire     o_clk_hdmi, // 125 MHz (5x core clk)
    output reg o_rst_core);
 
    wire   clkfb;
@@ -33,14 +34,15 @@ module clk_gen_boolean
 
    PLLE2_BASE
      #(.BANDWIDTH("OPTIMIZED"),
-       .CLKFBOUT_MULT(16),
-       .CLKIN1_PERIOD(10.0), //100MHz
-       .CLKOUT0_DIVIDE(128),
+       .CLKFBOUT_MULT(16),      // 100MHz * 16 = 1600MHz (VCO frequency)
+       .CLKIN1_PERIOD(10.0),    //100MHz
+       .CLKOUT0_DIVIDE(64),     // 1600MHz / 64 = 25 MHz (core clk)
+       .CLKOUT1_DIVIDE(12),     // 1600MHz / 12 = 133.33 MHz (HDMI clk)
        .DIVCLK_DIVIDE(1),
        .STARTUP_WAIT("FALSE"))
    PLLE2_BASE_inst
      (.CLKOUT0(o_clk_core),
-      .CLKOUT1(),
+      .CLKOUT1(o_clk_hdmi),
       .CLKOUT2(),
       .CLKOUT3(),
       .CLKOUT4(),
