@@ -1,0 +1,405 @@
+//////////////////////////////////////////////////////////////////////
+////                                                              ////
+////  VGA Character Display Controller with Wishbone Interface    ////
+////                                                              ////
+////  - 640x480 @ 60Hz resolution with 24-bit RGB output          ////
+////  - 40x30 character grid (16x16 pixel font)                   ////
+////  - Frame buffer-based rendering with sequential updates      ////
+////  - Wishbone-compatible register interface                    ////
+////                                                              ////
+//////////////////////////////////////////////////////////////////////
+
+// Main controller states
+typedef enum logic [1:0] {
+   IDLE,
+   WRITE_CHAR,
+   WRITE_BACKGROUND
+} mode_state_t;
+
+// Character rendering sub-states
+typedef enum logic [1:0] { 
+   CHAR_IDLE,
+   CHAR_WAIT_ROM,
+   CHAR_RENDER
+} char_render_state_t;
+
+// Background fill sub-states
+typedef enum logic [1:0] { 
+   BACKGROUND_IDLE,
+   BACKGROUND_FILL
+} background_render_state_t;
+
+
+
+
+module vga_top
+  #(parameter int dw = 32,
+    parameter int aw = 8,
+    parameter int RGB_DEPTH = 8)  // Bits per color channel (default 8 for 24-bit RGB)
+   (
+    // WISHBONE Interface
+    input  logic             wb_clk_i,
+    input  logic             wb_rst_i,
+    input  logic             wb_cyc_i,
+    input  logic [aw-1:0]    wb_adr_i,
+    input  logic [dw-1:0]    wb_dat_i,
+    input  logic [3:0]       wb_sel_i,
+    input  logic             wb_we_i,
+    input  logic             wb_stb_i,
+    output logic [dw-1:0]    wb_dat_o,
+    output logic             wb_ack_o,
+    output logic             wb_err_o,
+    
+    // VGA signals
+    output logic             hsync,
+    output logic             vsync,
+    output logic             video_on,
+    output logic [RGB_DEPTH-1:0]       red,
+    output logic [RGB_DEPTH-1:0]       green,
+    output logic [RGB_DEPTH-1:0]       blue
+    );
+
+   
+   //=============================================================================
+   // INTERNAL SIGNALS
+   //=============================================================================
+   
+   // Display timing signals from DTG
+   logic [11:0] pixel_row; 
+   logic [11:0] pixel_column;
+   
+   // RGB Frame buffers (640x480 pixel array)
+   logic [RGB_DEPTH-1:0] fb_red   [0:639][0:479];
+   logic [RGB_DEPTH-1:0] fb_green [0:639][0:479];
+   logic [RGB_DEPTH-1:0] fb_blue  [0:639][0:479];
+
+   // Font ROM interface
+   logic [7:0]   font_addr;
+   logic [255:0] char_bitmap;  // 16x16 character bitmap from ROM
+
+   // Wishbone register map
+   logic [dw-1:0] control_reg;   // 0x00: Control register (bit[0]=char, bit[1]=bg)
+   logic [dw-1:0] status_reg;    // 0x04: Status (bit[0]=busy)
+   logic [dw-1:0] char_pos_reg;  // 0x08: Character position (row[12:8], col[5:0])
+   logic [7:0]    ascii_char;    // 0x0C: ASCII character code
+   logic [dw-1:0] char_color;    // 0x10: Character color (RGB)
+   logic [dw-1:0] bg_color;      // 0x14: Background color (RGB)
+
+   // Register select signals
+   logic control_sel;
+   logic status_sel;
+   logic char_pos_sel;
+   logic ascii_code_sel;
+   logic char_color_sel;
+   logic bg_color_sel;
+
+   // State machine registers
+   mode_state_t            main_state, main_state_next;
+   char_render_state_t     char_state, char_state_next;
+   background_render_state_t bg_state, bg_state_next;
+
+   // Control signals
+   logic busy;
+   logic start_char_render;
+   logic start_bg_fill;
+   logic char_render_done;
+   logic bg_fill_done;
+
+   // Pixel iteration counters
+   logic [9:0] pixel_x;      // 0-639 (background) or 0-15 (character)
+   logic [8:0] pixel_y;      // 0-479 (background) or 0-15 (character)
+   logic [9:0] char_base_x;  // Character base X coordinate
+   logic [8:0] char_base_y;  // Character base Y coordinate
+
+   //=============================================================================
+   // SUBMODULE INSTANTIATIONS
+   //=============================================================================
+
+   // Display timing generator (640x480 @ 60Hz)
+   dtg dtg_inst (
+      .clock       (wb_clk_i),
+      .rst         (wb_rst_i),
+      .horiz_sync  (hsync),
+      .vert_sync   (vsync),
+      .video_on    (video_on),
+      .pixel_row   (pixel_row),
+      .pixel_column(pixel_column)
+   );
+
+   // Font ROM (16x16 bitmaps for ASCII characters)
+   font_rom #(
+      .MEM_FILE("bigfont.mem")
+   ) font_rom_inst (
+      .clk  (wb_clk_i),
+      .addr (font_addr),
+      .data (char_bitmap)
+   );
+
+   //=============================================================================
+   // COMBINATIONAL LOGIC
+   //=============================================================================
+
+   // Font address calculation (ASCII 32-127 maps to ROM addresses 0-95)
+   assign font_addr = ascii_char - 8'h20;
+
+   // Status register
+   assign status_reg[0] = busy;
+   assign busy = (main_state != IDLE);
+
+   // RGB output from frame buffers
+   always_comb begin
+      red   = fb_red[pixel_column][pixel_row];
+      green = fb_green[pixel_column][pixel_row];
+      blue  = fb_blue[pixel_column][pixel_row];
+   end
+
+
+   //=============================================================================
+   // WISHBONE REGISTER INTERFACE
+   //=============================================================================
+
+   // Address decode
+   always_comb begin
+      if (wb_cyc_i && wb_stb_i) begin
+         control_sel    = (wb_adr_i[5:2] == 4'h0);  // 0x00
+         status_sel     = (wb_adr_i[5:2] == 4'h1);  // 0x04
+         char_pos_sel   = (wb_adr_i[5:2] == 4'h2);  // 0x08
+         ascii_code_sel = (wb_adr_i[5:2] == 4'h3);  // 0x0C
+         char_color_sel = (wb_adr_i[5:2] == 4'h4);  // 0x10
+         bg_color_sel   = (wb_adr_i[5:2] == 4'h5);  // 0x14
+      end else begin
+         control_sel    = 1'b0;
+         status_sel     = 1'b0;
+         char_pos_sel   = 1'b0;
+         ascii_code_sel = 1'b0;
+         char_color_sel = 1'b0;
+         bg_color_sel   = 1'b0;
+      end
+   end
+
+   // Register writes (only accepted when IDLE to prevent mid-operation changes)
+   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+      if (wb_rst_i) begin
+         control_reg  <= '0;
+         char_pos_reg <= '0;
+         ascii_char   <= '0;
+         char_color   <= '0;
+         bg_color     <= '0;
+      end else if (main_state == IDLE && wb_we_i) begin
+         if (control_sel)    control_reg  <= wb_dat_i;
+         if (char_pos_sel)   char_pos_reg <= wb_dat_i;
+         if (ascii_code_sel) ascii_char   <= wb_dat_i[7:0];
+         if (char_color_sel) char_color   <= wb_dat_i;
+         if (bg_color_sel)   bg_color     <= wb_dat_i;
+      end
+   end
+
+   // Register reads
+   always_comb begin
+      priority if (control_sel)
+         wb_dat_o = control_reg;
+      else if (status_sel)
+         wb_dat_o = status_reg;
+      else if (char_pos_sel)
+         wb_dat_o = char_pos_reg;
+      else if (ascii_code_sel)
+         wb_dat_o = {24'd0, ascii_char};
+      else if (char_color_sel)
+         wb_dat_o = char_color;
+      else if (bg_color_sel)
+         wb_dat_o = bg_color;
+      else
+         wb_dat_o = '0;
+   end
+
+
+   //=============================================================================
+   // MAIN CONTROLLER STATE MACHINE
+   //=============================================================================
+
+   // State register
+   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+      if (wb_rst_i)
+         main_state <= IDLE;
+      else
+         main_state <= main_state_next;
+   end
+
+   // Next state logic
+   always_comb begin
+      main_state_next = main_state;
+      start_char_render = 1'b0;
+      start_bg_fill = 1'b0;
+      
+      case (main_state)
+         IDLE: begin
+            if (control_sel && wb_we_i) begin
+               if (wb_dat_i[0])
+                  main_state_next = WRITE_CHAR;
+               else if (wb_dat_i[1])
+                  main_state_next = WRITE_BACKGROUND;
+            end
+         end
+         
+         WRITE_CHAR: begin
+            start_char_render = 1'b1;
+            if (char_render_done)
+               main_state_next = IDLE;
+         end
+         
+         WRITE_BACKGROUND: begin
+            start_bg_fill = 1'b1;
+            if (bg_fill_done)
+               main_state_next = IDLE;
+         end
+         
+         default: main_state_next = IDLE;
+      endcase
+   end
+
+   //=============================================================================
+   // CHARACTER RENDER STATE MACHINE
+   //=============================================================================
+
+   // State register
+   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+      if (wb_rst_i)
+         char_state <= CHAR_IDLE;
+      else
+         char_state <= char_state_next;
+   end
+
+   // Next state logic
+   always_comb begin
+      char_state_next = char_state;
+      char_render_done = 1'b0;
+      
+      case (char_state)
+         CHAR_IDLE: begin
+            if (start_char_render)
+               char_state_next = CHAR_WAIT_ROM;
+         end
+         
+         CHAR_WAIT_ROM: begin
+            char_state_next = CHAR_RENDER;
+         end
+         
+         CHAR_RENDER: begin
+            if (pixel_x == 15 && pixel_y == 15) begin
+               char_state_next = CHAR_IDLE;
+               char_render_done = 1'b1;
+            end
+         end
+         
+         default: char_state_next = CHAR_IDLE;
+      endcase
+   end
+
+   // Datapath (pixel-by-pixel framebuffer writes)
+   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+      if (wb_rst_i) begin
+         pixel_x <= '0;
+         pixel_y <= '0;
+         char_base_x <= '0;
+         char_base_y <= '0;
+      end else begin
+         case (char_state)
+            CHAR_IDLE: begin
+               if (start_char_render) begin
+                  char_base_x <= char_pos_reg[5:0] << 4;   // Column * 16
+                  char_base_y <= char_pos_reg[12:8] << 4;  // Row * 16
+                  pixel_x <= '0;
+                  pixel_y <= '0;
+               end
+            end
+            
+            CHAR_RENDER: begin
+               // Write one pixel per cycle based on font bitmap
+               fb_red[char_base_x + pixel_x][char_base_y + pixel_y] <= 
+                  char_bitmap[pixel_y*16 + pixel_x] ? char_color[23:16] : bg_color[23:16];
+               fb_green[char_base_x + pixel_x][char_base_y + pixel_y] <= 
+                  char_bitmap[pixel_y*16 + pixel_x] ? char_color[15:8] : bg_color[15:8];
+               fb_blue[char_base_x + pixel_x][char_base_y + pixel_y] <= 
+                  char_bitmap[pixel_y*16 + pixel_x] ? char_color[7:0] : bg_color[7:0];
+
+               // Increment to next pixel
+               if (pixel_x == 15) begin
+                  pixel_x <= '0;
+                  pixel_y <= (pixel_y == 15) ? '0 : pixel_y + 1;
+               end else begin
+                  pixel_x <= pixel_x + 1;
+               end
+            end
+         endcase
+      end
+   end
+
+   //=============================================================================
+   // BACKGROUND FILL STATE MACHINE
+   //=============================================================================
+
+   // State register
+   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+      if (wb_rst_i)
+         bg_state <= BACKGROUND_IDLE;
+      else
+         bg_state <= bg_state_next;
+   end
+
+   // Next state logic
+   always_comb begin
+      bg_state_next = bg_state;
+      bg_fill_done = 1'b0;
+      
+      case (bg_state)
+         BACKGROUND_IDLE: begin
+            if (start_bg_fill)
+               bg_state_next = BACKGROUND_FILL;
+         end
+         
+         BACKGROUND_FILL: begin
+            if (pixel_x == 639 && pixel_y == 479) begin
+               bg_state_next = BACKGROUND_IDLE;
+               bg_fill_done = 1'b1;
+            end
+         end
+         
+         default: bg_state_next = BACKGROUND_IDLE;
+      endcase
+   end
+
+   // Datapath (full-screen fill, one pixel per cycle)
+   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+      if (wb_rst_i) begin
+         pixel_x <= '0;
+         pixel_y <= '0;
+      end else begin
+         case (bg_state)
+            BACKGROUND_IDLE: begin
+               if (start_bg_fill) begin
+                  pixel_x <= '0;
+                  pixel_y <= '0;
+               end
+            end
+            
+            BACKGROUND_FILL: begin
+               // Write one pixel per cycle
+               fb_red[pixel_x][pixel_y]   <= bg_color[23:16];
+               fb_green[pixel_x][pixel_y] <= bg_color[15:8];
+               fb_blue[pixel_x][pixel_y]  <= bg_color[7:0];
+               
+               // Increment to next pixel
+               if (pixel_x == 639) begin
+                  pixel_x <= '0;
+                  pixel_y <= (pixel_y == 479) ? '0 : pixel_y + 1;
+               end else begin
+                  pixel_x <= pixel_x + 1;
+               end
+            end
+         endcase
+      end
+   end
+
+endmodule 
+
+
