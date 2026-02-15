@@ -32,7 +32,7 @@ typedef enum logic [1:0] {
 
 
 
-module vga_top
+module vga_controller
   #(parameter int dw = 32,
     parameter int aw = 8,
     parameter int RGB_DEPTH = 8)  // Bits per color channel (default 8 for 24-bit RGB)
@@ -41,9 +41,11 @@ module vga_top
     input  logic             wb_clk_i,
     input  logic             wb_rst_i,
     input  logic             wb_cyc_i,
-    input  logic [aw-1:0]    wb_adr_i,
+    /* verilator lint_off UNUSEDSIGNAL */
+    input  logic [aw-1:0]    wb_adr_i,  // Only bits [5:2] used for register decode
     input  logic [dw-1:0]    wb_dat_i,
-    input  logic [3:0]       wb_sel_i,
+    input  logic [3:0]       wb_sel_i,  // Unused - all writes are full-word
+    /* verilator lint_on UNUSEDSIGNAL */
     input  logic             wb_we_i,
     input  logic             wb_stb_i,
     output logic [dw-1:0]    wb_dat_o,
@@ -65,8 +67,10 @@ module vga_top
    //=============================================================================
    
    // Display timing signals from DTG
-   logic [11:0] pixel_row; 
-   logic [11:0] pixel_column;
+   /* verilator lint_off UNUSEDSIGNAL */
+   logic [11:0] pixel_row;     // Only bits [8:0] used (max 479)
+   logic [11:0] pixel_column;  // Only bits [9:0] used (max 639)
+   /* verilator lint_on UNUSEDSIGNAL */
    
    // RGB Frame buffers (640x480 pixel array)
    logic [RGB_DEPTH-1:0] fb_red   [0:639][0:479];
@@ -104,6 +108,7 @@ module vga_top
    logic start_bg_fill;
    logic char_render_done;
    logic bg_fill_done;
+   logic clear_control_reg;
 
    // Pixel iteration counters
    logic [9:0] pixel_x;      // 0-639 (background) or 0-15 (character)
@@ -144,13 +149,14 @@ module vga_top
 
    // Status register
    assign status_reg[0] = busy;
+   assign status_reg[31:1] = 31'd0;  // Unused bits tied to 0
    assign busy = (main_state != IDLE);
 
-   // RGB output from frame buffers
+   // RGB output from frame buffers (cast to proper width)
    always_comb begin
-      red   = fb_red[pixel_column][pixel_row];
-      green = fb_green[pixel_column][pixel_row];
-      blue  = fb_blue[pixel_column][pixel_row];
+      red   = fb_red[pixel_column[9:0]][pixel_row[8:0]];
+      green = fb_green[pixel_column[9:0]][pixel_row[8:0]];
+      blue  = fb_blue[pixel_column[9:0]][pixel_row[8:0]];
    end
 
 
@@ -185,17 +191,27 @@ module vga_top
          ascii_char   <= '0;
          char_color   <= '0;
          bg_color     <= '0;
-      end else if (main_state == IDLE && wb_we_i) begin
-         if (control_sel)    control_reg  <= wb_dat_i;
-         if (char_pos_sel)   char_pos_reg <= wb_dat_i;
-         if (ascii_code_sel) ascii_char   <= wb_dat_i[7:0];
-         if (char_color_sel) char_color   <= wb_dat_i;
-         if (bg_color_sel)   bg_color     <= wb_dat_i;
+      end else begin
+         // State machine can clear control register after operation completes
+         if (clear_control_reg) begin
+            control_reg <= '0;
+         end
+         // Wishbone writes only accepted when IDLE
+         else if (main_state == IDLE && wb_we_i) begin
+            if (control_sel)    control_reg  <= wb_dat_i;
+            if (char_pos_sel)   char_pos_reg <= wb_dat_i;
+            if (ascii_code_sel) ascii_char   <= wb_dat_i[7:0];
+            if (char_color_sel) char_color   <= wb_dat_i;
+            if (bg_color_sel)   bg_color     <= wb_dat_i;
+         end
       end
    end
 
-   // Register reads
+   // Register reads and Wishbone acknowledgement
    always_comb begin
+      wb_ack_o = wb_cyc_i && wb_stb_i;  // Acknowledge all valid transactions
+      wb_err_o = 1'b0;  // No error conditions
+      
       priority if (control_sel)
          wb_dat_o = control_reg;
       else if (status_sel)
@@ -217,7 +233,7 @@ module vga_top
    // MAIN CONTROLLER STATE MACHINE
    //=============================================================================
 
-   // State register
+   // State register (async reset)
    always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
       if (wb_rst_i)
          main_state <= IDLE;
@@ -230,27 +246,31 @@ module vga_top
       main_state_next = main_state;
       start_char_render = 1'b0;
       start_bg_fill = 1'b0;
+      clear_control_reg = 1'b0;
       
       case (main_state)
          IDLE: begin
-            if (control_sel && wb_we_i) begin
-               if (wb_dat_i[0])
-                  main_state_next = WRITE_CHAR;
-               else if (wb_dat_i[1])
-                  main_state_next = WRITE_BACKGROUND;
-            end
+            // Check control register bits to start operations
+            if (control_reg[0])
+               main_state_next = WRITE_CHAR;
+            else if (control_reg[1])
+               main_state_next = WRITE_BACKGROUND;
          end
          
          WRITE_CHAR: begin
             start_char_render = 1'b1;
-            if (char_render_done)
+            if (char_render_done) begin
                main_state_next = IDLE;
+               clear_control_reg = 1'b1;  // Clear control register when done
+            end
          end
          
          WRITE_BACKGROUND: begin
             start_bg_fill = 1'b1;
-            if (bg_fill_done)
+            if (bg_fill_done) begin
                main_state_next = IDLE;
+               clear_control_reg = 1'b1;  // Clear control register when done
+            end
          end
          
          default: main_state_next = IDLE;
@@ -261,7 +281,7 @@ module vga_top
    // CHARACTER RENDER STATE MACHINE
    //=============================================================================
 
-   // State register
+   // State register (async reset)
    always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
       if (wb_rst_i)
          char_state <= CHAR_IDLE;
@@ -291,7 +311,10 @@ module vga_top
             end
          end
          
-         default: char_state_next = CHAR_IDLE;
+         default: begin
+            char_state_next = CHAR_IDLE;
+            char_render_done = 1'b0;
+         end
       endcase
    end
 
@@ -306,8 +329,8 @@ module vga_top
          case (char_state)
             CHAR_IDLE: begin
                if (start_char_render) begin
-                  char_base_x <= char_pos_reg[5:0] << 4;   // Column * 16
-                  char_base_y <= char_pos_reg[12:8] << 4;  // Row * 16
+                  char_base_x <= {4'd0, char_pos_reg[5:0]} << 4;   // Column * 16 with proper width
+                  char_base_y <= {4'd0, char_pos_reg[12:8]} << 4;  // Row * 16 with proper width
                   pixel_x <= '0;
                   pixel_y <= '0;
                end
@@ -330,6 +353,10 @@ module vga_top
                   pixel_x <= pixel_x + 1;
                end
             end
+            
+            default: begin
+               // Do nothing - maintain state
+            end
          endcase
       end
    end
@@ -338,7 +365,7 @@ module vga_top
    // BACKGROUND FILL STATE MACHINE
    //=============================================================================
 
-   // State register
+   // State register (async reset)
    always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
       if (wb_rst_i)
          bg_state <= BACKGROUND_IDLE;
@@ -364,7 +391,10 @@ module vga_top
             end
          end
          
-         default: bg_state_next = BACKGROUND_IDLE;
+         default: begin
+            bg_state_next = BACKGROUND_IDLE;
+            bg_fill_done = 1'b0;
+         end
       endcase
    end
 
@@ -395,6 +425,10 @@ module vga_top
                end else begin
                   pixel_x <= pixel_x + 1;
                end
+            end
+            
+            default: begin
+               // Do nothing - maintain state
             end
          endcase
       end

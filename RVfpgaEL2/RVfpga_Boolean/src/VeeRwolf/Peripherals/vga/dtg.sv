@@ -80,10 +80,10 @@ localparam VSYNC_START   = VERT_PIXELS + V_FRONT_PORCH;
 localparam VSYNC_END     = VERT_PIXELS + V_FRONT_PORCH + V_SYNC_WIDTH;
 localparam VCNT_MAX      = VERT_PIXELS + V_FRONT_PORCH + V_SYNC_WIDTH + V_BACK_PORCH - 1;
 
-always_ff @(posedge clock) begin: generate_video_signals
+always_ff @(posedge clock or posedge rst) begin: generate_video_signals
 	if (rst) begin
-		pixel_column <= 1'b0;
-		pixel_row    <= 1'b0;
+		pixel_column <= 12'd0;
+		pixel_row    <= 12'd0;
 		horiz_sync   <= 1'b1;
 		vert_sync    <= 1'b1;
 		video_on     <= 1'b0;

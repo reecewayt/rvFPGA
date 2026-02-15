@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.12)
 project(vga_testbenches)
 
+# Set policy for find_package to use <PackageName>_ROOT variables
+if(POLICY CMP0144)
+    cmake_policy(SET CMP0144 NEW)
+endif()
+
 # Find Verilator
 find_package(verilator HINTS $ENV{VERILATOR_ROOT})
 if (NOT verilator_FOUND)
@@ -14,14 +19,17 @@ enable_testing()
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Define RTL source directory
+set(VGA_RTL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../src/VeeRwolf/Peripherals/vga)
+
 # Memory file that needs to be copied to build directory
-set(MEM_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../bigfont.mem)
+set(MEM_FILE ${VGA_RTL_DIR}/bigfont.mem)
 configure_file(${MEM_FILE} ${CMAKE_CURRENT_BINARY_DIR}/bigfont.mem COPYONLY)
 
 # ============================================================
 # Test 1: Font ROM Testbench
 # ============================================================
-set(FONT_ROM_SV ${CMAKE_CURRENT_SOURCE_DIR}/../font_rom.sv)
+set(FONT_ROM_SV ${VGA_RTL_DIR}/font_rom.sv)
 set(FONT_ROM_TB ${CMAKE_CURRENT_SOURCE_DIR}/font_rom_tb.cpp)
 
 add_executable(font_rom_tb ${FONT_ROM_TB})
@@ -30,7 +38,7 @@ verilate(font_rom_tb
     SOURCES ${FONT_ROM_SV}
     PREFIX Vfont_rom
     TRACE
-    VERILATOR_ARGS -Wno-fatal
+    VERILATOR_ARGS -Wall
 )
 
 add_test(NAME font_rom_test 
@@ -40,17 +48,17 @@ add_test(NAME font_rom_test
 # ============================================================
 # Test 2: VGA Controller Testbench
 # ============================================================
-set(VGA_CONTROLLER_SV ${CMAKE_CURRENT_SOURCE_DIR}/../vga_controller.sv)
-set(DTG_SV ${CMAKE_CURRENT_SOURCE_DIR}/../dtg.sv)
+set(VGA_CONTROLLER_SV ${VGA_RTL_DIR}/vga_controller.sv)
+set(DTG_SV ${VGA_RTL_DIR}/dtg.sv)
 set(VGA_TB ${CMAKE_CURRENT_SOURCE_DIR}/vga_controler_tb.cpp)
 
 add_executable(vga_controler_tb ${VGA_TB})
 
 verilate(vga_controler_tb
     SOURCES ${VGA_CONTROLLER_SV} ${FONT_ROM_SV} ${DTG_SV}
-    PREFIX Vvga_top
+    PREFIX Vvga_controller
     TRACE
-    VERILATOR_ARGS -Wno-fatal --trace-depth 3
+    VERILATOR_ARGS -Wall --trace-depth 3
 )
 
 add_test(NAME vga_controller_test 
@@ -94,6 +102,7 @@ add_custom_target(run_test
 # ============================================================
 message(STATUS "")
 message(STATUS "VGA Testbenches Configuration:")
+message(STATUS "  RTL source directory: ${VGA_RTL_DIR}")
 message(STATUS "  Font ROM source: ${FONT_ROM_SV}")
 message(STATUS "  Font ROM testbench: ${FONT_ROM_TB}")
 message(STATUS "  VGA Controller source: ${VGA_CONTROLLER_SV}")
