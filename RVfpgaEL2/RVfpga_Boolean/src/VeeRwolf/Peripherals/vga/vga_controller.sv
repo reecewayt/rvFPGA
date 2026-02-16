@@ -53,6 +53,7 @@ module vga_controller
     output logic             wb_err_o,
     
     // VGA signals
+    input logic              pixel_clk,  // Pixel clock (25 MHz for 640x480 @ 60Hz)
     output logic             hsync,
     output logic             vsync,
     output logic             video_on,
@@ -72,10 +73,25 @@ module vga_controller
    logic [11:0] pixel_column;  // Only bits [9:0] used (max 639)
    /* verilator lint_on UNUSEDSIGNAL */
    
-   // RGB Frame buffers (640x480 pixel array)
-   logic [RGB_DEPTH-1:0] fb_red   [0:639][0:479];
-   logic [RGB_DEPTH-1:0] fb_green [0:639][0:479];
-   logic [RGB_DEPTH-1:0] fb_blue  [0:639][0:479];
+   // Pipelined pixel coordinates (for BRAM read latency)
+   /* verilator lint_off UNUSEDSIGNAL */
+   logic [9:0] pixel_column_d;  // Reserved for future pipelining
+   logic [8:0] pixel_row_d;     // Reserved for future pipelining
+   /* verilator lint_on UNUSEDSIGNAL */
+   
+   // Frame buffer BRAM interface
+   logic        fb_we;         // Write enable
+   logic [18:0] fb_waddr;      // Write address
+   logic        fb_wdata;      // Write data (1 bit)
+   logic [18:0] fb_raddr;      // Read address
+   logic        fb_rdata;      // Read data (1 bit, registered)
+   
+   // Address conversion function: converts (x,y) to linear address
+   /* verilator lint_off WIDTHEXPAND */
+   function automatic logic [18:0] xy_to_addr(input logic [9:0] x, input logic [8:0] y);
+      return (y * 10'd640) + x;
+   endfunction
+   /* verilator lint_on WIDTHEXPAND */
 
    // Font ROM interface
    logic [7:0]   font_addr;
@@ -122,7 +138,7 @@ module vga_controller
 
    // Display timing generator (640x480 @ 60Hz)
    dtg dtg_inst (
-      .clock       (wb_clk_i),
+      .clock       (pixel_clk),
       .rst         (wb_rst_i),
       .horiz_sync  (hsync),
       .vert_sync   (vsync),
@@ -135,9 +151,20 @@ module vga_controller
    font_rom #(
       .MEM_FILE("bigfont.mem")
    ) font_rom_inst (
-      .clk  (wb_clk_i),
+      .clk  (pixel_clk),
       .addr (font_addr),
       .data (char_bitmap)
+   );
+
+   // Frame buffer BRAM (640x480 = 307200 bits)
+   framebuffer_bram fb_bram_inst (
+      .clk   (pixel_clk),
+      .rst   (wb_rst_i),
+      .we    (fb_we),
+      .waddr (fb_waddr),
+      .wdata (fb_wdata),
+      .raddr (fb_raddr),
+      .rdata (fb_rdata)
    );
 
    //=============================================================================
@@ -152,11 +179,33 @@ module vga_controller
    assign status_reg[31:1] = 31'd0;  // Unused bits tied to 0
    assign busy = (main_state != IDLE);
 
-   // RGB output from frame buffers (cast to proper width)
+   // Frame buffer read address (for video output)
+   assign fb_raddr = xy_to_addr(pixel_column[9:0], pixel_row[8:0]);
+
+   // Pipeline pixel coordinates to align with BRAM read latency
+   always_ff @(posedge pixel_clk or posedge wb_rst_i) begin
+      if (wb_rst_i) begin
+         pixel_column_d <= '0;
+         pixel_row_d <= '0;
+      end else begin
+         pixel_column_d <= pixel_column[9:0];
+         pixel_row_d <= pixel_row[8:0];
+      end
+   end
+
+   // RGB output: select color based on framebuffer bit (uses pipelined coordinates)
    always_comb begin
-      red   = fb_red[pixel_column[9:0]][pixel_row[8:0]];
-      green = fb_green[pixel_column[9:0]][pixel_row[8:0]];
-      blue  = fb_blue[pixel_column[9:0]][pixel_row[8:0]];
+      if (fb_rdata) begin
+         // Character pixel - use char_color
+         red   = char_color[23:16];
+         green = char_color[15:8];
+         blue  = char_color[7:0];
+      end else begin
+         // Background pixel - use bg_color
+         red   = bg_color[23:16];
+         green = bg_color[15:8];
+         blue  = bg_color[7:0];
+      end
    end
 
 
@@ -234,7 +283,7 @@ module vga_controller
    //=============================================================================
 
    // State register (async reset)
-   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+   always_ff @(posedge pixel_clk or posedge wb_rst_i) begin
       if (wb_rst_i)
          main_state <= IDLE;
       else
@@ -282,7 +331,7 @@ module vga_controller
    //=============================================================================
 
    // State register (async reset)
-   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+   always_ff @(posedge pixel_clk or posedge wb_rst_i) begin
       if (wb_rst_i)
          char_state <= CHAR_IDLE;
       else
@@ -318,32 +367,37 @@ module vga_controller
       endcase
    end
 
-   // Datapath (pixel-by-pixel framebuffer writes)
-   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+   // Datapath (combined character rendering and background fill)
+   // Both operations share the same write port and counters
+   always_ff @(posedge pixel_clk or posedge wb_rst_i) begin
       if (wb_rst_i) begin
          pixel_x <= '0;
          pixel_y <= '0;
          char_base_x <= '0;
          char_base_y <= '0;
+         fb_we <= 1'b0;
+         fb_waddr <= '0;
+         fb_wdata <= '0;
       end else begin
+         // Default: no write
+         fb_we <= 1'b0;
+         
+         // Character rendering datapath
          case (char_state)
             CHAR_IDLE: begin
                if (start_char_render) begin
-                  char_base_x <= {4'd0, char_pos_reg[5:0]} << 4;   // Column * 16 with proper width
-                  char_base_y <= {4'd0, char_pos_reg[12:8]} << 4;  // Row * 16 with proper width
+                  char_base_x <= {4'd0, char_pos_reg[5:0]} << 4;   // Column * 16
+                  char_base_y <= {4'd0, char_pos_reg[12:8]} << 4;  // Row * 16
                   pixel_x <= '0;
                   pixel_y <= '0;
                end
             end
             
             CHAR_RENDER: begin
-               // Write one pixel per cycle based on font bitmap
-               fb_red[char_base_x + pixel_x][char_base_y + pixel_y] <= 
-                  char_bitmap[pixel_y*16 + pixel_x] ? char_color[23:16] : bg_color[23:16];
-               fb_green[char_base_x + pixel_x][char_base_y + pixel_y] <= 
-                  char_bitmap[pixel_y*16 + pixel_x] ? char_color[15:8] : bg_color[15:8];
-               fb_blue[char_base_x + pixel_x][char_base_y + pixel_y] <= 
-                  char_bitmap[pixel_y*16 + pixel_x] ? char_color[7:0] : bg_color[7:0];
+               // Write one bit per pixel based on font bitmap
+               fb_we <= 1'b1;
+               fb_waddr <= xy_to_addr(char_base_x + pixel_x, char_base_y + pixel_y);
+               fb_wdata <= char_bitmap[pixel_y*16 + pixel_x];
 
                // Increment to next pixel
                if (pixel_x == 15) begin
@@ -355,7 +409,36 @@ module vga_controller
             end
             
             default: begin
-               // Do nothing - maintain state
+               // Do nothing
+            end
+         endcase
+         
+         // Background fill datapath (runs when char_state is IDLE)
+         case (bg_state)
+            BACKGROUND_IDLE: begin
+               if (start_bg_fill) begin
+                  pixel_x <= '0;
+                  pixel_y <= '0;
+               end
+            end
+            
+            BACKGROUND_FILL: begin
+               // Clear pixel (set to background)
+               fb_we <= 1'b1;
+               fb_waddr <= xy_to_addr(pixel_x, pixel_y);
+               fb_wdata <= 1'b0;
+               
+               // Increment to next pixel
+               if (pixel_x == 639) begin
+                  pixel_x <= '0;
+                  pixel_y <= (pixel_y == 479) ? '0 : pixel_y + 1;
+               end else begin
+                  pixel_x <= pixel_x + 1;
+               end
+            end
+            
+            default: begin
+               // Do nothing
             end
          endcase
       end
@@ -366,7 +449,7 @@ module vga_controller
    //=============================================================================
 
    // State register (async reset)
-   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
+   always_ff @(posedge pixel_clk or posedge wb_rst_i) begin
       if (wb_rst_i)
          bg_state <= BACKGROUND_IDLE;
       else
@@ -396,42 +479,6 @@ module vga_controller
             bg_fill_done = 1'b0;
          end
       endcase
-   end
-
-   // Datapath (full-screen fill, one pixel per cycle)
-   always_ff @(posedge wb_clk_i or posedge wb_rst_i) begin
-      if (wb_rst_i) begin
-         pixel_x <= '0;
-         pixel_y <= '0;
-      end else begin
-         case (bg_state)
-            BACKGROUND_IDLE: begin
-               if (start_bg_fill) begin
-                  pixel_x <= '0;
-                  pixel_y <= '0;
-               end
-            end
-            
-            BACKGROUND_FILL: begin
-               // Write one pixel per cycle
-               fb_red[pixel_x][pixel_y]   <= bg_color[23:16];
-               fb_green[pixel_x][pixel_y] <= bg_color[15:8];
-               fb_blue[pixel_x][pixel_y]  <= bg_color[7:0];
-               
-               // Increment to next pixel
-               if (pixel_x == 639) begin
-                  pixel_x <= '0;
-                  pixel_y <= (pixel_y == 479) ? '0 : pixel_y + 1;
-               end else begin
-                  pixel_x <= pixel_x + 1;
-               end
-            end
-            
-            default: begin
-               // Do nothing - maintain state
-            end
-         endcase
-      end
    end
 
 endmodule 

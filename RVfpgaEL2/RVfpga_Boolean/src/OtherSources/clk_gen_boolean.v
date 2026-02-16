@@ -24,26 +24,34 @@
 module clk_gen_boolean
   (input  wire i_clk,
    input  wire     i_rst,
-   output wire     o_clk_core,  // 25 MHz
-   output wire     o_clk_hdmi, // 125 MHz (5x core clk)
+   output wire     o_clk_core,  // 12.5 MHz
+   output wire     o_clk_hdmi,  // 125 MHz
+   output wire     o_clk_vga,   // 25 MHz
+   output wire     o_clk_locked,
    output reg o_rst_core);
 
    wire   clkfb;
    wire   locked;
    reg 	  locked_r;
+   
+   // Unbuffered clock outputs from PLL
+   wire   clk_core_unbuf;
+   wire   clk_hdmi_unbuf;
+   wire   clk_vga_unbuf;
 
    PLLE2_BASE
      #(.BANDWIDTH("OPTIMIZED"),
-       .CLKFBOUT_MULT(16),      // 100MHz * 16 = 1600MHz (VCO frequency)
+       .CLKFBOUT_MULT(10),      // 100MHz * 10 = 1000MHz (VCO frequency)
        .CLKIN1_PERIOD(10.0),    //100MHz
-       .CLKOUT0_DIVIDE(64),     // 1600MHz / 64 = 25 MHz (core clk)
-       .CLKOUT1_DIVIDE(12),     // 1600MHz / 12 = 133.33 MHz (HDMI clk)
+       .CLKOUT0_DIVIDE(80),     // 1000MHz / 80 = 12.5 MHz (core clk)
+       .CLKOUT1_DIVIDE(8),      // 1000MHz / 8 = 125 MHz (HDMI clk)
+       .CLKOUT2_DIVIDE(40),     // 1000MHz / 40 = 25 MHz (VGA clk)
        .DIVCLK_DIVIDE(1),
        .STARTUP_WAIT("FALSE"))
    PLLE2_BASE_inst
-     (.CLKOUT0(o_clk_core),
-      .CLKOUT1(o_clk_hdmi),
-      .CLKOUT2(),
+     (.CLKOUT0(clk_core_unbuf),
+      .CLKOUT1(clk_hdmi_unbuf),
+      .CLKOUT2(clk_vga_unbuf),
       .CLKOUT3(),
       .CLKOUT4(),
       .CLKOUT5(),
@@ -53,6 +61,24 @@ module clk_gen_boolean
       .PWRDWN(1'b0),
       .RST(i_rst),
       .CLKFBIN(clkfb));
+
+   // Global clock buffers for proper routing
+   BUFG bufg_core (
+      .I(clk_core_unbuf),
+      .O(o_clk_core)
+   );
+
+   BUFG bufg_hdmi (
+      .I(clk_hdmi_unbuf),
+      .O(o_clk_hdmi)
+   );
+
+   BUFG bufg_vga (
+      .I(clk_vga_unbuf),
+      .O(o_clk_vga)
+   );
+
+   assign o_clk_locked = locked;
 
    always @(posedge o_clk_core) begin
       locked_r <= locked;

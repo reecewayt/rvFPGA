@@ -30,13 +30,15 @@ void wb_write(Vvga_controller* dut, uint8_t addr, uint32_t data, VerilatedVcdC* 
     dut->wb_stb_i = 1;
     dut->wb_cyc_i = 1;
     
-    // Clock cycle
+    // Clock cycle (both clocks)
     dut->wb_clk_i = 1;
+    dut->pixel_clk = 1;
     dut->eval();
     tfp->dump(sim_time);
     sim_time++;
     
     dut->wb_clk_i = 0;
+    dut->pixel_clk = 0;
     dut->eval();
     tfp->dump(sim_time);
     sim_time++;
@@ -54,13 +56,15 @@ uint32_t wb_read(Vvga_controller* dut, uint8_t addr, VerilatedVcdC* tfp) {
     dut->wb_stb_i = 1;
     dut->wb_cyc_i = 1;
     
-    // Clock cycle
+    // Clock cycle (both clocks)
     dut->wb_clk_i = 1;
+    dut->pixel_clk = 1;
     dut->eval();
     tfp->dump(sim_time);
     sim_time++;
     
     dut->wb_clk_i = 0;
+    dut->pixel_clk = 0;
     dut->eval();
     tfp->dump(sim_time);
     sim_time++;
@@ -77,11 +81,13 @@ uint32_t wb_read(Vvga_controller* dut, uint8_t addr, VerilatedVcdC* tfp) {
 // Helper: Simple clock cycle
 void clock_cycle(Vvga_controller* dut, VerilatedVcdC* tfp) {
     dut->wb_clk_i = 1;
+    dut->pixel_clk = 1;
     dut->eval();
     tfp->dump(sim_time);
     sim_time++;
     
     dut->wb_clk_i = 0;
+    dut->pixel_clk = 0;
     dut->eval();
     tfp->dump(sim_time);
     sim_time++;
@@ -115,6 +121,7 @@ int main(int argc, char** argv) {
     
     // Initialize signals
     dut->wb_clk_i = 0;
+    dut->pixel_clk = 0;
     dut->wb_rst_i = 1;
     dut->wb_cyc_i = 0;
     dut->wb_adr_i = 0;
@@ -388,6 +395,73 @@ int main(int argc, char** argv) {
     
     std::cout << "  ✓ Rendered " << (col) << " characters: PASS\n" << std::endl;
     passed_count++;
+    
+    // ========================================
+    // Test 7: RGB Output Verification
+    // ========================================
+    test_count++;
+    std::cout << "Test 7: RGB Output Color Verification" << std::endl;
+    
+    // Set a distinctive background color (purple: R=200, G=50, B=150)
+    uint32_t test_bg_color = 0x00C83296;  // RGB = (200, 50, 150)
+    wb_write(dut, REG_BG_COLOR, test_bg_color, tfp);
+    
+    // Trigger background fill to set entire screen to this color
+    std::cout << "  Setting background to RGB(200, 50, 150)..." << std::endl;
+    wb_write(dut, REG_CONTROL, CTRL_WRITE_BG, tfp);
+    
+    // Wait for background fill to complete
+    cycles = wait_for_idle(dut, tfp, 310000);
+    
+    if (cycles == -1) {
+        std::cout << "  ✗ Background fill timeout: FAIL\n" << std::endl;
+        test_passed = false;
+    } else {
+        std::cout << "  ✓ Background fill completed" << std::endl;
+        
+        // Now wait for video_on signal and sample RGB outputs
+        // Advance simulation until we see video_on
+        bool found_video_on = false;
+        int max_scan_cycles = 100000;  // Max cycles to search for video_on
+        
+        for (int i = 0; i < max_scan_cycles; i++) {
+            clock_cycle(dut, tfp);
+            
+            if (dut->video_on) {
+                found_video_on = true;
+                
+                // Sample RGB outputs (multiple times to be sure)
+                uint8_t sampled_red = dut->red;
+                uint8_t sampled_green = dut->green;
+                uint8_t sampled_blue = dut->blue;
+                
+                std::cout << "  Sampled RGB outputs during video_on:" << std::endl;
+                std::cout << "    Red:   " << (int)sampled_red << " (expected 200)" << std::endl;
+                std::cout << "    Green: " << (int)sampled_green << " (expected 50)" << std::endl;
+                std::cout << "    Blue:  " << (int)sampled_blue << " (expected 150)" << std::endl;
+                
+                // Verify colors match expected background
+                if (sampled_red == 200 && sampled_green == 50 && sampled_blue == 150) {
+                    std::cout << "  ✓ RGB outputs match background color: PASS" << std::endl;
+                    passed_count++;
+                } else {
+                    std::cout << "  ✗ RGB outputs do not match: FAIL" << std::endl;
+                    test_passed = false;
+                }
+                
+                break;
+            }
+        }
+        
+        if (!found_video_on) {
+            std::cout << "  ⚠ Warning: video_on signal not detected in " 
+                      << max_scan_cycles << " cycles" << std::endl;
+            std::cout << "  ✗ Could not verify RGB outputs: FAIL" << std::endl;
+            test_passed = false;
+        }
+    }
+    
+    std::cout << std::endl;
     
     // ========================================
     // Final Summary

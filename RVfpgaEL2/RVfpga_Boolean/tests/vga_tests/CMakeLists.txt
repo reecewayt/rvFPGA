@@ -50,12 +50,13 @@ add_test(NAME font_rom_test
 # ============================================================
 set(VGA_CONTROLLER_SV ${VGA_RTL_DIR}/vga_controller.sv)
 set(DTG_SV ${VGA_RTL_DIR}/dtg.sv)
+set(FRAMEBUFFER_BRAM_SV ${VGA_RTL_DIR}/framebuffer_bram.sv)
 set(VGA_TB ${CMAKE_CURRENT_SOURCE_DIR}/vga_controler_tb.cpp)
 
 add_executable(vga_controler_tb ${VGA_TB})
 
 verilate(vga_controler_tb
-    SOURCES ${VGA_CONTROLLER_SV} ${FONT_ROM_SV} ${DTG_SV}
+    SOURCES ${VGA_CONTROLLER_SV} ${FONT_ROM_SV} ${DTG_SV} ${FRAMEBUFFER_BRAM_SV}
     PREFIX Vvga_controller
     TRACE
     VERILATOR_ARGS -Wall --trace-depth 3
@@ -107,6 +108,7 @@ message(STATUS "  Font ROM source: ${FONT_ROM_SV}")
 message(STATUS "  Font ROM testbench: ${FONT_ROM_TB}")
 message(STATUS "  VGA Controller source: ${VGA_CONTROLLER_SV}")
 message(STATUS "  Display Timing Generator: ${DTG_SV}")
+message(STATUS "  Framebuffer BRAM: ${FRAMEBUFFER_BRAM_SV}")
 message(STATUS "  VGA Controller testbench: ${VGA_TB}")
 message(STATUS "  Memory file: ${MEM_FILE}")
 message(STATUS "  Build directory: ${CMAKE_CURRENT_BINARY_DIR}")
