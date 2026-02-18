@@ -3,7 +3,7 @@
 // Reads complete 16x16 character bitmap in a single cycle
 
 module font_rom #(
-    parameter MEM_FILE = "bigfont.mem",
+    parameter MEM_FILE = "vga_font_16x16.mem",
     parameter ADDR_WIDTH = 8,           // 256 addresses for 256 characters
     parameter DATA_WIDTH = 256,         // 16 rows x 16 bits per row = 256 bits per character
     parameter CHAR_WIDTH = 16,          // Character width in pixels

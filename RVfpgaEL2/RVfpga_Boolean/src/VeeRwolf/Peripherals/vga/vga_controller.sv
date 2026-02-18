@@ -149,7 +149,7 @@ module vga_controller
 
    // Font ROM (16x16 bitmaps for ASCII characters)
    font_rom #(
-      .MEM_FILE("bigfont.mem")
+      .MEM_FILE("vga_font_16x16.mem")
    ) font_rom_inst (
       .clk  (pixel_clk),
       .addr (font_addr),
@@ -171,8 +171,8 @@ module vga_controller
    // COMBINATIONAL LOGIC
    //=============================================================================
 
-   // Font address calculation (ASCII 32-127 maps to ROM addresses 0-95)
-   assign font_addr = ascii_char - 8'h20;
+   // Font address calculation (ASCII 0-255 (extended) maps to ROM addresses 0-255)
+   assign font_addr = ascii_char;
 
    // Status register
    assign status_reg[0] = busy;
@@ -397,7 +397,7 @@ module vga_controller
                // Write one bit per pixel based on font bitmap
                fb_we <= 1'b1;
                fb_waddr <= xy_to_addr(char_base_x + pixel_x, char_base_y + pixel_y);
-               fb_wdata <= char_bitmap[pixel_y*16 + pixel_x];
+               fb_wdata <= char_bitmap[pixel_y*16 + (15 - pixel_x)];
 
                // Increment to next pixel
                if (pixel_x == 15) begin
