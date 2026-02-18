@@ -12,52 +12,78 @@
 #include <stdint.h>
 
 // VGA Peripheral Registers
-#define VGA_BASE    0x80001500
-#define VGA_COORDS  (VGA_BASE+0x1)
-#define VGA_DATA    (VGA_BASE+0x3)
+#define VGA_BASE        0x80001500
+#define VGA_CONTROL     (*(volatile uint32_t*)(VGA_BASE + 0x00))
+#define VGA_STATUS      (*(volatile uint32_t*)(VGA_BASE + 0x04))
+#define VGA_CHAR_POS    (*(volatile uint32_t*)(VGA_BASE + 0x08))
+#define VGA_ASCII       (*(volatile uint32_t*)(VGA_BASE + 0x0C))
+#define VGA_CHAR_COLOR  (*(volatile uint32_t*)(VGA_BASE + 0x10))
+#define VGA_BG_COLOR    (*(volatile uint32_t*)(VGA_BASE + 0x14))
 
-#define CHAR_SPACING    30  // TODO: May need to adjust spacing vars to get spacing equal
-#define HS_OFFSET       20  // Used in x-plane
-#define VS_OFFSET       20  // Used in y-plane
+#define CHAR_SPACING    3  // TODO: May need to adjust spacing vars to get spacing equal
+#define HS_OFFSET       3 // Used in x-plane
+#define VS_OFFSET       5  // Used in y-plane
+
+#define X_MAX_OFFSET    40
+#define Y_MAX_OFFSET    30
 
 #define READ_REG(addr)        (*(volatile unsigned *)(addr))
 #define WRITE_REG(addr, val)  (*(volatile unsigned *)(addr) = (val))
 
-#define DELAY_AMOUNT    10000   // TODO: Adjust delay amount to match around 1 second
+#define DELAY_AMOUNT    1000000   // TODO: Adjust delay amount to match around 1 second
 
 void delay(int count);
-void writeVGA(uint8_t data, uint16_t x, uint16_t y);
+void writeVGA(uint8_t row, uint8_t col, char c, uint32_t color);
+void vga_clear_screen(uint32_t bg_color);
 
 int main (void) {
 
     uint16_t xCoord = 0;
     uint16_t yCoord = VS_OFFSET;
-    uint8_t displayValue = 0;
+    uint16_t location = 0;
+    char displayValue = '0';
 
-    // TODO: Implement display of red background
+    /*
+    while(1) {
+        //vga_clear_screen(0x00FF0000);
+
+        for (int i = 0; i < X_MAX_OFFSET; i++) {
+            for (int j = 0; j < Y_MAX_OFFSET; j++) {
+                //vga_clear_screen(0x00FF0000);
+                xCoord = i;
+                yCoord = j;
+                writeVGA(yCoord, xCoord, '0', 0x00FFFFFF);
+                delay(40000);
+            }
+        }
+
+    }*/
+
 
     while (1) {
+        vga_clear_screen(0x00FF0000);
+
         // Set new offset for next character
-        xCoord = (CHAR_SPACING * displayValue) + HS_OFFSET;
+        xCoord = (CHAR_SPACING * location) + HS_OFFSET;
 
         // Display current value to VGA
-        if (displayValue % 2) {
-            writeVGA(0, xCoord, yCoord);
+        if (!(displayValue % 2)) {
+            writeVGA(yCoord, xCoord, '0', 0x00FFFFFF);
         } else {
-            writeVGA(displayValue, xCoord, yCoord);
+            writeVGA(yCoord, xCoord, displayValue, 0x00FFFFFF);
         }
 
         // Add bit of delay between display of character
         delay(DELAY_AMOUNT);
 
-        // Check if value is under 10, else reset back to 0
-        if (displayValue < 10) {
+        // Check if value is under or equal to 9, else reset back to 0
+        if (location >= 0 && location < 9) {
             displayValue += 1;
+            location += 1;
         } else {
-            displayValue = 0;
+            displayValue = '0';
+            location = 0;
         }
-
-        // TODO: May need to implement a clearing phase to clear previous character data on screen
 
     }
 
@@ -67,13 +93,29 @@ void delay(int count) {
     for(volatile int i = 0; i < count; i++);
 }
 
-void writeVGA(uint8_t data, uint16_t x, uint16_t y) {
-    uint32_t xyCoords = ((y & 0x3FF) << 10) | (x & 0x3FF);
+void writeVGA(uint8_t row, uint8_t col, char c, uint32_t color) {
+    // Wait for controller to be ready
+    while (VGA_STATUS & 0x01);
+    
+    // Configure character
+    VGA_CHAR_POS = (row << 8) | col;
+    VGA_ASCII = c;
+    VGA_CHAR_COLOR = color;
+    
+    // Trigger character write
+    VGA_CONTROL = 0x01;
+}
 
-    // Write to data register with input value
-    WRITE_REG(VGA_DATA, data);
-
-    // Write to COORD register to set location
-    WRITE_REG(VGA_COORDS, xyCoords);
-
+void vga_clear_screen(uint32_t bg_color) {
+    // Wait for controller to be ready
+    while (VGA_STATUS & 0x01);
+    
+    // Set background color
+    VGA_BG_COLOR = bg_color;
+    
+    // Trigger background fill
+    VGA_CONTROL = 0x02;
+    
+    // Wait for completion (takes ~12ms)
+    while (VGA_STATUS & 0x01);
 }
