@@ -97,6 +97,15 @@ module veerwolf_core
     inout wire [2:0]   o_rgb1,   // On-board color RGB LEDs
 `endif
 
+    // HDMI signals
+    input wire         clk_hdmi,     // 125 MHz HDMI clock
+    input wire         clk_vga,      // 25 MHz VGA pixel clock
+    input wire         pix_clk_locked,  // Pixel clock locked signal from clk_gen
+    output wire        hdmi_clk_n,   // HDMI differential clock negative
+    output wire        hdmi_clk_p,   // HDMI differential clock positive
+    output wire [2:0]  hdmi_tx_n,    // HDMI differential data negative
+    output wire [2:0]  hdmi_tx_p,    // HDMI differential data positive
+
     input wire  clk,
     input wire         rstn,
     input wire         dmi_reg_en,
@@ -317,6 +326,58 @@ module veerwolf_core
    assign wb_s2m_sys_err = 1'b0;
    assign wb_s2m_sys_rty = 1'b0;
 
+   // VGA Signals
+   wire hsync;
+   wire vsync;
+   wire video_on;
+   wire [7:0] vga_r;
+   wire [7:0] vga_g;
+   wire [7:0] vga_b;
+
+   vga_controller vga_controller(
+      //wishbone interface
+      .wb_clk_i     (clk),
+      .wb_rst_i     (wb_rst),
+      .wb_cyc_i     (wb_m2s_vga_cyc),
+      .wb_adr_i     ({2'b0,wb_m2s_vga_adr[5:2],2'b0}),
+      .wb_dat_i     (wb_m2s_vga_dat),
+      .wb_sel_i     (4'b1111),
+      .wb_we_i      (wb_m2s_vga_we),
+      .wb_stb_i     (wb_m2s_vga_stb),
+      .wb_dat_o     (wb_s2m_vga_dat),
+      .wb_ack_o     (wb_s2m_vga_ack),
+      .wb_err_o     (wb_s2m_vga_err),
+      // vga signals
+      .pixel_clk     (clk_vga),
+      .hsync         (hsync),
+      .vsync         (vsync),
+      .video_on      (video_on),
+      .red           (vga_r),
+      .green         (vga_g),
+      .blue          (vga_b)
+   );
+
+   //hmdi-vga bridge
+   hdmi_tx_v1_0 hdmi_tx_inst(
+      .pix_clk(clk_vga),
+      .pix_clkx5(clk_hdmi),
+      .pix_clk_locked(pix_clk_locked),
+      .rst(~rst_n), 
+      .hsync(hsync),
+      .vsync(vsync),
+      .vde(video_on),
+      .red(vga_r),
+      .green(vga_g),
+      .blue(vga_b),
+      .aux0_din(), 
+      .aux1_din(),
+      .aux2_din(),
+      .ade(),
+      .TMDS_CLK_P(hdmi_clk_p),
+      .TMDS_CLK_N(hdmi_clk_n),
+      .TMDS_DATA_P(hdmi_tx_p),
+      .TMDS_DATA_N(hdmi_tx_n)
+   );
 
    // GPIO - Leds and Switches
    wire [31:0] en_gpio;
@@ -363,6 +424,8 @@ module veerwolf_core
    bidirec gpio31 (.oe(en_gpio[31]), .inp(o_gpio[31]), .outp(i_gpio[31]), .bidir(io_data[31]));
 
 `endif
+
+   
 
 
    gpio_top gpio_module(
