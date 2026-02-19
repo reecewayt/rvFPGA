@@ -68,7 +68,7 @@
 //`timescale 1 ps / 1ps
 
 module hdmi_tx_v1_0 # (
-  parameter MODE = "HDMI",		// Encoder Mode: HDMI or DVI
+  parameter MODE = "DVI",		// Encoder Mode: HDMI or DVI
   parameter C_RED_WIDTH = 8,	// Width of Red Channel
   parameter C_GREEN_WIDTH = 8,  // Width of Green Channel
   parameter C_BLUE_WIDTH = 8	// Width of Blue Channel
