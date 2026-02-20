@@ -60,6 +60,18 @@ wire [31:0] wb_s2m_gpio_dat;
 wire        wb_s2m_gpio_ack;
 wire        wb_s2m_gpio_err;
 wire        wb_s2m_gpio_rty;
+wire [31:0] wb_m2s_vga_adr;
+wire [31:0] wb_m2s_vga_dat;
+wire  [3:0] wb_m2s_vga_sel;
+wire        wb_m2s_vga_we;
+wire        wb_m2s_vga_cyc;
+wire        wb_m2s_vga_stb;
+wire  [2:0] wb_m2s_vga_cti;
+wire  [1:0] wb_m2s_vga_bte;
+wire [31:0] wb_s2m_vga_dat;
+wire        wb_s2m_vga_ack;
+wire        wb_s2m_vga_err;
+wire        wb_s2m_vga_rty;
 wire [31:0] wb_m2s_gpio2_adr;
 wire [31:0] wb_m2s_gpio2_dat;
 wire  [3:0] wb_m2s_gpio2_sel;
@@ -160,6 +172,18 @@ wb_intercon wb_intercon0
     .wb_gpio_ack_i  (wb_s2m_gpio_ack),
     .wb_gpio_err_i  (wb_s2m_gpio_err),
     .wb_gpio_rty_i  (wb_s2m_gpio_rty),
+    .wb_vga_adr_o   (wb_m2s_vga_adr),
+    .wb_vga_dat_o   (wb_m2s_vga_dat),
+    .wb_vga_sel_o   (wb_m2s_vga_sel),
+    .wb_vga_we_o    (wb_m2s_vga_we),
+    .wb_vga_cyc_o   (wb_m2s_vga_cyc),
+    .wb_vga_stb_o   (wb_m2s_vga_stb),
+    .wb_vga_cti_o   (wb_m2s_vga_cti),
+    .wb_vga_bte_o   (wb_m2s_vga_bte),
+    .wb_vga_dat_i   (wb_s2m_vga_dat),
+    .wb_vga_ack_i   (wb_s2m_vga_ack),
+    .wb_vga_err_i   (wb_s2m_vga_err),
+    .wb_vga_rty_i   (wb_s2m_vga_rty),
     .wb_gpio2_adr_o (wb_m2s_gpio2_adr),
     .wb_gpio2_dat_o (wb_m2s_gpio2_dat),
     .wb_gpio2_sel_o (wb_m2s_gpio2_sel),

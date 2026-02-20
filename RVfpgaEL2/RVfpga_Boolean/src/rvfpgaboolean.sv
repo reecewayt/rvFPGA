@@ -33,7 +33,12 @@ module rvfpgaboolean
     output reg [7:0]   AN,
     output reg         CA, CB, CC, CD, CE, CF, CG, CA_1, CB_1, CC_1, CD_1, CE_1, CF_1, CG_1,
     output wire [2:0]  RGB0, // On-board color LEDs
-    output wire [2:0]  RGB1  // On-board color LEDs
+    output wire [2:0]  RGB1,  // On-board color LEDs
+    // HDMI signals
+    output wire        hdmi_clk_n,
+    output wire        hdmi_clk_p,
+    output wire [2:0]  hdmi_tx_n,
+    output wire [2:0]  hdmi_tx_p
     );
 
 
@@ -42,14 +47,20 @@ module rvfpgaboolean
    localparam RAM_SIZE     = 32'h10000;
 
    wire    clk_core;
+   wire    clk_hdmi;
+   wire    clk_vga;
    wire    rst_core;
+   wire pix_clk_locked;
 
    clk_gen_boolean
    clk_gen
      (.i_clk (clk),
       .i_rst (1'b0),
       .o_clk_core (clk_core),
-      .o_rst_core (rst_core));
+      .o_clk_hdmi (clk_hdmi),
+      .o_clk_vga (clk_vga),
+      .o_rst_core (rst_core),
+      .o_clk_locked(pix_clk_locked));
 
 
    wire [5:0]  ram_awid;
@@ -164,7 +175,7 @@ module rvfpgaboolean
 
    veerwolf_core
      #(.bootrom_file (bootrom_file),
-       .clk_freq_hz  (32'd12_500_000))
+       .clk_freq_hz  (32'd12_500_000)) //updated to 12.5MHz 
    veerwolf
      (.clk  (clk_core),
       .rstn (~rst_core),
@@ -225,7 +236,15 @@ module rvfpgaboolean
       .o_rgb0         (RGB0),
       .o_rgb1         (RGB1),
       .AN (AN),
-      .Digits_Bits ({CA,CB,CC,CD,CE,CF,CG}));
+      .Digits_Bits ({CA,CB,CC,CD,CE,CF,CG}),
+      // HDMI signals
+      .clk_hdmi       (clk_hdmi),
+      .clk_vga        (clk_vga),
+      .pix_clk_locked  (pix_clk_locked),
+      .hdmi_clk_n     (hdmi_clk_n),
+      .hdmi_clk_p     (hdmi_clk_p),
+      .hdmi_tx_n      (hdmi_tx_n),
+      .hdmi_tx_p      (hdmi_tx_p));
 
    always @(posedge clk_core) begin
       o_led[15:0] <= gpio_out[15:0];

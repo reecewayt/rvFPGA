@@ -1,0 +1,1 @@
+This implementation include everything from project 1, and adds the VGA controller to the wishbone bus. The VGA controller is a more complex peripheral that allows you to write pixel data to a framebuffer and have it displayed on a monitor. It also includes a character rendering mode for displaying text. 
