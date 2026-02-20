@@ -1,7 +1,7 @@
 /*
  * display_int_vga.c - app for displaying integers in a sequence on VGA
  * 
- * Display application for interfacing with a VGA controller on the RealDigital Boolean
+ * Display application for interfacing with a VGA controller on the RealDigital Boolean.
  * Displays numbers 0-9 in a sequence across the screen, but for even numbers, the digit
  * displayed is a 0. Also, the background is set to a red color.
  * 
@@ -11,7 +11,7 @@
 
 #include <stdint.h>
 
-// VGA Peripheral Registers
+// VGA Peripheral Registers (set as vars)
 #define VGA_BASE        0x80001500
 #define VGA_CONTROL     (*(volatile uint32_t*)(VGA_BASE + 0x00))
 #define VGA_STATUS      (*(volatile uint32_t*)(VGA_BASE + 0x04))
@@ -20,57 +20,38 @@
 #define VGA_CHAR_COLOR  (*(volatile uint32_t*)(VGA_BASE + 0x10))
 #define VGA_BG_COLOR    (*(volatile uint32_t*)(VGA_BASE + 0x14))
 
-#define CHAR_SPACING    3  // TODO: May need to adjust spacing vars to get spacing equal
-#define HS_OFFSET       3 // Used in x-plane
-#define VS_OFFSET       5  // Used in y-plane
+// Character Offset Values
+// Box is 40x30, set horizontal and vertical offset from TOP-LEFT corner
+#define CHAR_SPACING    3
+#define HS_OFFSET       3
+#define VS_OFFSET       5
 
-#define X_MAX_OFFSET    40
-#define Y_MAX_OFFSET    30
+// Misc Defines
+#define DELAY_AMOUNT    2500000   
 
-#define READ_REG(addr)        (*(volatile unsigned *)(addr))
-#define WRITE_REG(addr, val)  (*(volatile unsigned *)(addr) = (val))
-
-#define DELAY_AMOUNT    1000000   // TODO: Adjust delay amount to match around 1 second
-
+// Function Prototypes
 void delay(int count);
-void writeVGA(uint8_t row, uint8_t col, char c, uint32_t color);
+void vga_write_char(uint8_t row, uint8_t col, char c, uint32_t color);
 void vga_clear_screen(uint32_t bg_color);
 
 int main (void) {
-
     uint16_t xCoord = 0;
     uint16_t yCoord = VS_OFFSET;
     uint16_t location = 0;
     char displayValue = '0';
 
-    /*
-    while(1) {
-        //vga_clear_screen(0x00FF0000);
-
-        for (int i = 0; i < X_MAX_OFFSET; i++) {
-            for (int j = 0; j < Y_MAX_OFFSET; j++) {
-                //vga_clear_screen(0x00FF0000);
-                xCoord = i;
-                yCoord = j;
-                writeVGA(yCoord, xCoord, '0', 0x00FFFFFF);
-                delay(40000);
-            }
-        }
-
-    }*/
-
-
     while (1) {
+        // Clear screen and set screen to RED
         vga_clear_screen(0x00FF0000);
 
         // Set new offset for next character
         xCoord = (CHAR_SPACING * location) + HS_OFFSET;
 
-        // Display current value to VGA
+        // Display current value to VGA (even is set to 0, odd is unchanged)
         if (!(displayValue % 2)) {
-            writeVGA(yCoord, xCoord, '0', 0x00FFFFFF);
+            vga_write_char(yCoord, xCoord, '0', 0x00FFFFFF);
         } else {
-            writeVGA(yCoord, xCoord, displayValue, 0x00FFFFFF);
+            vga_write_char(yCoord, xCoord, displayValue, 0x00FFFFFF);
         }
 
         // Add bit of delay between display of character
@@ -89,11 +70,13 @@ int main (void) {
 
 }
 
+// delay - delays for a set count
 void delay(int count) {
     for(volatile int i = 0; i < count; i++);
 }
 
-void writeVGA(uint8_t row, uint8_t col, char c, uint32_t color) {
+// vga_write_char - writes char with set color at (row,col) location
+void vga_write_char(uint8_t row, uint8_t col, char c, uint32_t color) {
     // Wait for controller to be ready
     while (VGA_STATUS & 0x01);
     
@@ -106,6 +89,7 @@ void writeVGA(uint8_t row, uint8_t col, char c, uint32_t color) {
     VGA_CONTROL = 0x01;
 }
 
+// vga_clear_screen - clears the screen and sets the background to a color
 void vga_clear_screen(uint32_t bg_color) {
     // Wait for controller to be ready
     while (VGA_STATUS & 0x01);
