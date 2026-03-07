@@ -5,3 +5,4 @@ vivado/
 *.log
 *.jou
 vivado_project/
+*.str

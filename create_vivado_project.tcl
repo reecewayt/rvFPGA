@@ -2,15 +2,18 @@
 # =============================================================================
 # create_vivado_project.tcl
 #
-# Automates Vivado project creation and bitstream generation for the
-# RVfpgaEL2-Boolean RISC-V SoC targeting Real Digital's Boolean FPGA board
-# (Xilinx Spartan-7, xc7s50csga324-1).
+# Sets up a Vivado project for the RVfpgaEL2-Boolean RISC-V SoC targeting
+# Real Digital's Boolean FPGA board (Xilinx Spartan-7, xc7s50csga324-1)
+# and integrates the SHA-3 Wishbone peripheral extension.
 #
-# Also integrates the SHA-3 Wishbone peripheral extension from:
-#   extensions/sha3/rtl/
+# If the project already exists it is opened directly without re-running
+# setup, so re-running the script is safe and fast.
+#
+# Synthesis, implementation, and bitstream generation are left to the user
+# to run interactively in the Vivado GUI.
 #
 # Usage:
-#   vivado -mode batch -source create_vivado_project.tcl
+#   vivado -mode gui   -source create_vivado_project.tcl
 #   vivado -mode batch -source create_vivado_project.tcl -tclargs <proj_dir> <proj_name>
 #
 # Optional tclargs:
@@ -35,8 +38,16 @@ set SHA3_PATH [file join $SCRIPT_DIR "extensions" "sha3"]
 # Target FPGA part
 set FPGA_PART "xc7s50csga324-1"
 
-# Number of parallel jobs for synthesis / implementation
-set JOBS 4
+# =============================================================================
+# NOTE: Synthesis, implementation, and bitstream generation are intentionally
+# NOT automated here. Use the Vivado GUI Flow Navigator to run them.
+# =============================================================================
+
+# =============================================================================
+# Idempotency — if the .xpr already exists, just open it and stop
+# =============================================================================
+
+# (evaluated after argv is parsed below)
 
 # =============================================================================
 # Parse optional command-line arguments
@@ -52,6 +63,22 @@ if {[llength $argv] >= 2} {
     set PROJECT_NAME [lindex $argv 1]
 } else {
     set PROJECT_NAME "rvfpga_boolean"
+}
+
+# =============================================================================
+# Idempotency check — open existing project and exit early
+# =============================================================================
+
+set XPR_FILE [file join $PROJECT_DIR "${PROJECT_NAME}.xpr"]
+
+if {[file exists $XPR_FILE]} {
+    puts "============================================================"
+    puts "Project already exists — opening: $XPR_FILE"
+    puts "============================================================"
+    open_project $XPR_FILE
+    puts "Project opened. Use the Flow Navigator to run synthesis,"
+    puts "implementation, and bitstream generation."
+    return
 }
 
 # =============================================================================
@@ -225,38 +252,15 @@ set_property -name {STEPS.OPT_DESIGN.ARGS.MORE OPTIONS} \
              -objects [get_runs impl_1]
 
 # =============================================================================
-# Step 6 — Generate Bitstream (Synth → Impl → Bitstream)
+# Done — project is configured, hand off to the user
 # =============================================================================
 
-puts "\n--- Step 6: Launching synthesis ---"
-
-launch_runs synth_1 -jobs $JOBS
-wait_on_run synth_1
-
-if {[get_property PROGRESS [get_runs synth_1]] != "100%"} {
-    puts "ERROR: Synthesis did not complete successfully."
-    exit 1
-}
-puts "   Synthesis complete."
-
-puts "\n--- Step 6: Launching implementation ---"
-
-launch_runs impl_1 -jobs $JOBS
-wait_on_run impl_1
-
-if {[get_property PROGRESS [get_runs impl_1]] != "100%"} {
-    puts "ERROR: Implementation did not complete successfully."
-    exit 1
-}
-puts "   Implementation complete."
-
-puts "\n--- Step 6: Writing bitstream ---"
-
-open_run impl_1
-write_bitstream -force \
-    [file join $PROJECT_DIR "${PROJECT_NAME}.runs" "impl_1" "${PROJECT_NAME}.bit"]
-
 puts "\n============================================================"
-puts "Bitstream generation complete!"
-puts "Output: $PROJECT_DIR/${PROJECT_NAME}.runs/impl_1/${PROJECT_NAME}.bit"
+puts "Project setup complete!"
+puts "Project file: $XPR_FILE"
+puts ""
+puts "Next steps in the Vivado GUI Flow Navigator:"
+puts "  1. Run Synthesis"
+puts "  2. Run Implementation"
+puts "  3. Generate Bitstream"
 puts "============================================================\n"

@@ -2,8 +2,9 @@
 # =============================================================================
 # create_vivado_project.sh
 #
-# Shell wrapper that invokes Vivado in batch mode to run
-# create_vivado_project.tcl.
+# Sets up the RVfpgaEL2-Boolean Vivado project (first run) or re-opens it
+# (subsequent runs), then launches the Vivado GUI so the user can run
+# synthesis, implementation, and bitstream generation interactively.
 #
 # Usage:
 #   ./create_vivado_project.sh [<project_dir>] [<project_name>]
@@ -30,7 +31,7 @@ if ! command -v vivado &>/dev/null; then
 fi
 
 echo "========================================================"
-echo "  RVfpgaEL2-Boolean — Vivado Project & Bitstream Build"
+echo "  RVfpgaEL2-Boolean — Vivado Project Setup"
 echo "========================================================"
 echo "  Project dir  : ${PROJECT_DIR}"
 echo "  Project name : ${PROJECT_NAME}"
@@ -38,7 +39,14 @@ echo "  Vivado       : $(command -v vivado)"
 echo "========================================================"
 echo ""
 
-vivado -mode batch \
-       -source "${TCL_SCRIPT}" \
-       -notrace \
-       -tclargs "${PROJECT_DIR}" "${PROJECT_NAME}"
+XPR="${PROJECT_DIR}/${PROJECT_NAME}.xpr"
+
+if [[ -f "${XPR}" ]]; then
+    echo "Project already exists — opening ${XPR}"
+    vivado "${XPR}"
+else
+    echo "Creating new project..."
+    vivado -mode gui \
+           -source "${TCL_SCRIPT}" \
+           -tclargs "${PROJECT_DIR}" "${PROJECT_NAME}"
+fi
