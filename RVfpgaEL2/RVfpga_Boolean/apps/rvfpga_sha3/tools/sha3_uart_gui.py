@@ -31,6 +31,11 @@ class Sha3UartGui:
         self.pending_digest_chars = ""
         self.pending_hash_deadline = 0.0
         self.poll_after_id = None
+        
+        # UART throttling parameters
+        self.uart_delay_threshold = 100  # Start throttling above this message size
+        self.uart_burst_size = 16        # Characters to send before pause
+        self.uart_burst_delay_ms = 2     # Milliseconds to pause after each burst
 
         self._build_ui()
         self._refresh_ports()
@@ -73,8 +78,8 @@ class Sha3UartGui:
         ).grid(row=0, column=1, padx=6)
 
         ttk.Button(controls, text="Set Mode", command=self._set_mode).grid(row=0, column=2, padx=4)
-        ttk.Button(controls, text="Query Status", command=self._query_status).grid(row=0, column=3, padx=4)
-        ttk.Button(controls, text="Ping", command=lambda: self._send_line("PING")).grid(row=0, column=4, padx=4)
+        ttk.Button(controls, text="Ping", command=lambda: self._send_line("PING")).grid(row=0, column=3, padx=4)
+        ttk.Button(controls, text="Query Status", command=self._query_status).grid(row=0, column=4, padx=4)
 
         ttk.Label(controls, text="Input Message:").grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.msg_var = tk.StringVar()
@@ -96,10 +101,60 @@ class Sha3UartGui:
         self.verify_var = tk.StringVar(value="(waiting)")
         ttk.Entry(verify, textvariable=self.verify_var, state="readonly", width=120).pack(fill="x")
 
-        status = ttk.LabelFrame(frame, text="Controller Status", padding=8)
+        status = ttk.LabelFrame(frame, text="Controller Status (Wishbone Registers)", padding=8)
         status.pack(fill="x", pady=(10, 0))
-        self.status_var = tk.StringVar(value="(waiting)")
-        ttk.Entry(status, textvariable=self.status_var, state="readonly", width=120).pack(fill="x")
+        
+        # FSM State row
+        fsm_frame = ttk.Frame(status)
+        fsm_frame.pack(fill="x", pady=2)
+        ttk.Label(fsm_frame, text="FSM:", width=12, anchor="w").pack(side="left")
+        self.status_idle = tk.Label(fsm_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_idle.pack(side="left")
+        ttk.Label(fsm_frame, text="IDLE", width=8).pack(side="left")
+        self.status_busy = tk.Label(fsm_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_busy.pack(side="left")
+        ttk.Label(fsm_frame, text="BUSY", width=8).pack(side="left")
+        self.status_done = tk.Label(fsm_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_done.pack(side="left")
+        ttk.Label(fsm_frame, text="DONE", width=8).pack(side="left")
+        
+        # FIFO Status row
+        fifo_frame = ttk.Frame(status)
+        fifo_frame.pack(fill="x", pady=2)
+        ttk.Label(fifo_frame, text="FIFO:", width=12, anchor="w").pack(side="left")
+        self.status_in_empty = tk.Label(fifo_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_in_empty.pack(side="left")
+        ttk.Label(fifo_frame, text="IN_EMPTY", width=12).pack(side="left")
+        self.status_in_full = tk.Label(fifo_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_in_full.pack(side="left")
+        ttk.Label(fifo_frame, text="IN_FULL", width=12).pack(side="left")
+        self.status_out_empty = tk.Label(fifo_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_out_empty.pack(side="left")
+        ttk.Label(fifo_frame, text="OUT_EMPTY", width=12).pack(side="left")
+        self.status_out_full = tk.Label(fifo_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_out_full.pack(side="left")
+        ttk.Label(fifo_frame, text="OUT_FULL", width=12).pack(side="left")
+        
+        # Error flags row
+        err_frame = ttk.Frame(status)
+        err_frame.pack(fill="x", pady=2)
+        ttk.Label(err_frame, text="Errors:", width=12, anchor="w").pack(side="left")
+        self.status_err_ill = tk.Label(err_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_err_ill.pack(side="left")
+        ttk.Label(err_frame, text="ILL_WR", width=12).pack(side="left")
+        self.status_err_uf = tk.Label(err_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_err_uf.pack(side="left")
+        ttk.Label(err_frame, text="UNDERFLOW", width=12).pack(side="left")
+        self.status_err_of = tk.Label(err_frame, text="●", font=("TkDefaultFont", 14), fg="gray")
+        self.status_err_of.pack(side="left")
+        ttk.Label(err_frame, text="OVERFLOW", width=12).pack(side="left")
+        
+        # Raw status text
+        raw_frame = ttk.Frame(status)
+        raw_frame.pack(fill="x", pady=(4, 0))
+        ttk.Label(raw_frame, text="Raw:", width=12, anchor="w").pack(side="left")
+        self.status_raw_var = tk.StringVar(value="(not queried)")
+        ttk.Label(raw_frame, textvariable=self.status_raw_var, foreground="#666").pack(side="left", fill="x", expand=True)
 
         logs = ttk.LabelFrame(frame, text="UART Log", padding=8)
         logs.pack(fill="both", expand=True, pady=(10, 0))
@@ -216,9 +271,11 @@ class Sha3UartGui:
                 self.verify_var.set("Waiting for full digest line...")
                 self._accumulate_digest_chars(line)
         elif line.startswith("OK STATUS "):
-            self.status_var.set(line[len("OK STATUS "):].strip())
+            status_hex = line[len("OK STATUS "):].strip()
+            self._parse_and_display_status(status_hex)
         elif line.startswith("OK MODE "):
-            self.status_var.set(f"mode={line[len('OK MODE '):].strip()}")
+            mode_val = line[len('OK MODE '):].strip()
+            self.status_raw_var.set(f"mode={mode_val}")
         elif self.awaiting_hash_digest:
             self._accumulate_digest_chars(line)
 
@@ -322,8 +379,20 @@ class Sha3UartGui:
             messagebox.showerror("UART", "Not connected")
             return
         try:
-            self.ser.write((cmd + "\n").encode())
-            self._log(f"-> {cmd}")
+            # For large commands, send in bursts to prevent UART RX FIFO overflow
+            # while maintaining reasonable speed
+            if len(cmd) > self.uart_delay_threshold:
+                cmd_bytes = cmd.encode()
+                for i in range(0, len(cmd_bytes), self.uart_burst_size):
+                    burst = cmd_bytes[i:i + self.uart_burst_size]
+                    self.ser.write(burst)
+                    # Pause after each burst to let UART FIFO drain
+                    if i + self.uart_burst_size < len(cmd_bytes):
+                        time.sleep(self.uart_burst_delay_ms / 1000.0)
+                self.ser.write(b"\n")
+            else:
+                self.ser.write((cmd + "\n").encode())
+            self._log(f"-> {cmd[:80]}{'...' if len(cmd) > 80 else ''}")
         except Exception as exc:  # pylint: disable=broad-except
             messagebox.showerror("UART", f"Failed to send:\n{exc}")
 
@@ -351,6 +420,70 @@ class Sha3UartGui:
         self.verify_var.set("Waiting for FPGA digest...")
         self._send_line(f"HASH {msg}")
 
+    def _parse_and_display_status(self, status_line: str) -> None:
+        """Parse STATUS register hex value and update individual flag indicators."""
+        try:
+            # Extract status=0x... from response line
+            # Format: "mode=256 status=0x13 idle=1 done=0 in_full=0 err=0x0"
+            import re
+            match = re.search(r'status=(0x[0-9a-fA-F]+)', status_line)
+            if not match:
+                # Try parsing whole string as hex (fallback)
+                status_hex = status_line.strip().lower()
+                if status_hex.startswith("0x"):
+                    status_hex = status_hex[2:]
+                status_val = int(status_hex, 16)
+            else:
+                status_hex = match.group(1)
+                status_val = int(status_hex, 16)
+            
+            # Update raw display
+            self.status_raw_var.set(status_line.strip())
+            
+            # Parse individual bits based on README register map
+            # Bit 0: IDLE
+            idle = bool(status_val & (1 << 0))
+            self.status_idle.config(fg="green" if idle else "gray")
+            
+            # Bit 1: BUSY
+            busy = bool(status_val & (1 << 1))
+            self.status_busy.config(fg="orange" if busy else "gray")
+            
+            # Bit 2: DONE
+            done = bool(status_val & (1 << 2))
+            self.status_done.config(fg="blue" if done else "gray")
+            
+            # Bit 4: IN_EMPTY
+            in_empty = bool(status_val & (1 << 4))
+            self.status_in_empty.config(fg="cyan" if in_empty else "gray")
+            
+            # Bit 5: IN_FULL
+            in_full = bool(status_val & (1 << 5))
+            self.status_in_full.config(fg="red" if in_full else "gray")
+            
+            # Bit 6: OUT_EMPTY
+            out_empty = bool(status_val & (1 << 6))
+            self.status_out_empty.config(fg="cyan" if out_empty else "gray")
+            
+            # Bit 7: OUT_FULL
+            out_full = bool(status_val & (1 << 7))
+            self.status_out_full.config(fg="red" if out_full else "gray")
+            
+            # Bit 8: ERR_ILL (illegal write)
+            err_ill = bool(status_val & (1 << 8))
+            self.status_err_ill.config(fg="red" if err_ill else "gray")
+            
+            # Bit 9: ERR_UF (underflow)
+            err_uf = bool(status_val & (1 << 9))
+            self.status_err_uf.config(fg="red" if err_uf else "gray")
+            
+            # Bit 10: ERR_OF (overflow)
+            err_of = bool(status_val & (1 << 10))
+            self.status_err_of.config(fg="red" if err_of else "gray")
+            
+        except (ValueError, IndexError) as exc:
+            self.status_raw_var.set(f"Parse error: {exc}")
+    
     def _log(self, msg: str) -> None:
         self.log_text.configure(state="normal")
         self.log_text.insert("end", msg + "\n")

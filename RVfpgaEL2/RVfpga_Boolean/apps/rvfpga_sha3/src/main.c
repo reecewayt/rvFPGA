@@ -14,7 +14,6 @@ PRE_COMPILED_MSG("no platform was defined")
 
 // Memory map (Wishbone peripherals behind AXI2WB window at 0x8000_0000)
 #define SHA3_BASE_ADDR         0x80001D00u
-#define LED_BASE_ADDR          0x80001400u
 #define UART_BASE_ADDR         0x80002000u
 
 #define MMIO32(addr)           (*(volatile uint32_t *)(addr))
@@ -29,8 +28,6 @@ PRE_COMPILED_MSG("no platform was defined")
 #define UART_RX_DATA           MMIO32(UART_BASE_ADDR + 0x00u)
 #define UART_LINE_STATUS       MMIO32(UART_BASE_ADDR + 0x14u)
 
-#define STATUS_REG             MMIO32(LED_BASE_ADDR)
-
 #define SHA3_CTRL_START        (1u << 0)
 #define SHA3_CTRL_ABORT        (1u << 2)
 #define SHA3_CTRL_MODE_SHIFT   3u
@@ -42,6 +39,13 @@ PRE_COMPILED_MSG("no platform was defined")
 #define SHA3_ST_ERR_MASK       ((1u << 8) | (1u << 9) | (1u << 10))
 
 #define UART_LSR_DR            (1u << 0)
+
+/* Maximum UART command line (including command verb and message text). */
+#define UART_CMD_MAX_LEN       1048576u
+
+/* SHA3 completion wait budget: base + (bytes * slope), saturated at UINT32 max. */
+#define SHA3_WAIT_BASE_CYCLES      40000000u
+#define SHA3_WAIT_PER_BYTE_CYCLES  20000u
 
 typedef enum {
     SHA3_MODE_224 = 0,
@@ -128,6 +132,21 @@ static int sha3_wait_done(uint32_t timeout_cycles) {
     return -2;
 }
 
+static uint32_t sha3_timeout_cycles_for_len(size_t msg_len) {
+    uint32_t msg_u32;
+
+    if (msg_len > 0xFFFFFFFFu) {
+        return 0xFFFFFFFFu;
+    }
+
+    msg_u32 = (uint32_t)msg_len;
+    if (msg_u32 > ((0xFFFFFFFFu - SHA3_WAIT_BASE_CYCLES) / SHA3_WAIT_PER_BYTE_CYCLES)) {
+        return 0xFFFFFFFFu;
+    }
+
+    return SHA3_WAIT_BASE_CYCLES + (msg_u32 * SHA3_WAIT_PER_BYTE_CYCLES);
+}
+
 static void sha3_read_digest(uint32_t *out_words, uint32_t count) {
     uint32_t i;
     for (i = 0; i < count; i++) {
@@ -145,10 +164,15 @@ static int sha3_hash_message(sha3_mode_t mode,
     sha3_reset();
     sha3_set_mode(mode);
     sha3_set_msglen((uint64_t)msg_len);
-    sha3_write_bytes(msg, msg_len);
     sha3_start();
 
-    if (sha3_wait_done(40000000u) != 0) {
+    /*
+     * Stream input after START so messages larger than the 64-word
+     * input FIFO do not deadlock while waiting for space.
+     */
+    sha3_write_bytes(msg, msg_len);
+
+    if (sha3_wait_done(sha3_timeout_cycles_for_len(msg_len)) != 0) {
         return -1;
     }
 
@@ -208,6 +232,7 @@ static int parse_mode_value(const char *s, sha3_mode_t *mode_out) {
 
 static int uart_read_line(char *out, size_t max_len) {
     size_t n = 0u;
+    int truncated = 0;
 
     while (1) {
         while ((UART_LINE_STATUS & UART_LSR_DR) == 0u) {
@@ -220,7 +245,7 @@ static int uart_read_line(char *out, size_t max_len) {
 
         if (c == '\n') {
             out[n] = '\0';
-            return 0;
+            return truncated ? 1 : 0;
         }
 
         if (c == '\b' || c == 0x7F) {
@@ -232,6 +257,8 @@ static int uart_read_line(char *out, size_t max_len) {
 
         if (n + 1u < max_len) {
             out[n++] = c;
+        } else {
+            truncated = 1;
         }
     }
 }
@@ -244,12 +271,11 @@ static void print_digest(const uint32_t *digest, uint32_t count) {
 }
 
 int main(void) {
-    char cmd[384];
+    static char cmd[UART_CMD_MAX_LEN];
     sha3_mode_t mode = SHA3_MODE_256;
 
     uartInit();
 
-    STATUS_REG = 0x60000000u;
     printfNexys("OK READY sha3-uart-iface mode=%u\n", (unsigned)sha3_mode_bits(mode));
     printfNexys("OK HELP commands: STATUS | MODE <224|256|384|512> | HASH <text> | PING\n");
 
@@ -258,7 +284,9 @@ int main(void) {
         uint32_t words = 0u;
         uint32_t st;
 
-        if (uart_read_line(cmd, sizeof(cmd)) != 0) {
+        int line_rc = uart_read_line(cmd, sizeof(cmd));
+        if (line_rc != 0) {
+            printfNexys("ERR LINE_TOO_LONG max=%u\n", (unsigned)(UART_CMD_MAX_LEN - 1u));
             continue;
         }
 
@@ -293,22 +321,26 @@ int main(void) {
             }
             mode = new_mode;
             sha3_set_mode(mode);
-            STATUS_REG = 0x61000000u | (sha3_mode_bits(mode) & 0xFFFFu);
             printfNexys("OK MODE %u\n", (unsigned)sha3_mode_bits(mode));
             continue;
         }
 
         if (starts_with_ci(line, "HASH")) {
-            const char *msg = skip_spaces(line + 4);
+            const char *msg = line + 4;
+            if (*msg == ' ') {
+                /*
+                 * Consume one separator after command verb.
+                 * Preserve remaining bytes exactly as message payload.
+                 */
+                msg++;
+            }
             size_t len = strlen(msg);
 
             if (sha3_hash_message(mode, (const uint8_t *)msg, len, digest, &words) != 0) {
-                STATUS_REG = 0xE1000000u | (SHA3_STATUS & 0xFFFFu);
                 printfNexys("ERR HASH hw_status=0x%x\n", SHA3_STATUS);
                 continue;
             }
 
-            STATUS_REG = 0x62000000u | (words & 0xFFu);
             printfNexys("OK HASH ");
             print_digest(digest, words);
             printfNexys("\n");
