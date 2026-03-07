@@ -228,17 +228,45 @@ class Sha3StressTest:
         self.status_err_of.pack(side="left")
         ttk.Label(err_frame, text="OVERFLOW", width=10).pack(side="left")
         
+        # Side-by-side log row for test results and UART trace.
+        logs_row = ttk.Frame(main_frame)
+        logs_row.pack(fill="both", expand=True, pady=(10, 0))
+        logs_row.columnconfigure(0, weight=1)
+        logs_row.columnconfigure(1, weight=1)
+        logs_row.rowconfigure(0, weight=1)
+
         # Results frame with scrolled text
-        results_frame = ttk.LabelFrame(main_frame, text="Test Results", padding=8)
-        results_frame.pack(fill="both", expand=True, pady=(10, 0))
-        
+        results_frame = ttk.LabelFrame(logs_row, text="Test Results", padding=8)
+        results_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
         self.results_text = scrolledtext.ScrolledText(results_frame, height=15, wrap="none", state="disabled")
         self.results_text.pack(fill="both", expand=True)
-        
+
         # Configure text tags for colored output
         self.results_text.tag_config("pass", foreground="green")
         self.results_text.tag_config("fail", foreground="red")
         self.results_text.tag_config("header", font=("TkDefaultFont", 9, "bold"))
+
+        # Raw UART frame with separate TX/RX/system trace.
+        uart_frame = ttk.LabelFrame(logs_row, text="Raw UART Communication", padding=8)
+        uart_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+
+        self.uart_text = scrolledtext.ScrolledText(uart_frame, height=15, wrap="none", state="disabled")
+        self.uart_text.pack(fill="both", expand=True)
+        self.uart_text.tag_config("tx", foreground="#1f6feb")
+        self.uart_text.tag_config("rx", foreground="#0a7f2e")
+        self.uart_text.tag_config("uart_error", foreground="#b00020")
+        self.uart_text.tag_config("sys", foreground="#666666")
+
+        # Digest comparison frame for detailed expected vs actual logging.
+        digest_frame = ttk.LabelFrame(main_frame, text="Digest Comparison Log", padding=8)
+        digest_frame.pack(fill="both", expand=True, pady=(10, 0))
+
+        self.digest_text = scrolledtext.ScrolledText(digest_frame, height=10, wrap="none", state="disabled")
+        self.digest_text.pack(fill="both", expand=True)
+        self.digest_text.tag_config("match", foreground="green")
+        self.digest_text.tag_config("mismatch", foreground="red")
+        self.digest_text.tag_config("digest_info", foreground="#444444")
     
     def _refresh_ports(self) -> None:
         """Refresh list of serial ports."""
@@ -268,6 +296,7 @@ class Sha3StressTest:
         self.connect_btn.configure(state="disabled")
         self.disconnect_btn.configure(state="normal")
         self._log_result("Connected to {} @ {}".format(port, baud), "header")
+        self._log_uart(f"[sys] Connected to {port} @ {baud}", "sys")
     
     def _disconnect(self) -> None:
         """Disconnect from serial port."""
@@ -286,6 +315,7 @@ class Sha3StressTest:
         self.connect_btn.configure(state="normal")
         self.disconnect_btn.configure(state="disabled")
         self._log_result("Disconnected", "header")
+        self._log_uart("[sys] Disconnected", "sys")
         self.rx_partial.clear()
     
     def _reader_loop(self) -> None:
@@ -329,6 +359,8 @@ class Sha3StressTest:
         """Handle a received line from UART."""
         if not line:
             return
+
+        self._log_uart(f"<- {line}", "rx")
         
         if line.startswith("[error]"):
             self.last_response = {"type": "error", "data": line}
@@ -427,6 +459,7 @@ class Sha3StressTest:
         if not self.ser:
             raise RuntimeError("Not connected to serial port")
         self.ser.write((cmd + "\n").encode())
+        self._log_uart(f"-> {cmd}", "tx")
     
     def _send_ping(self) -> None:
         """Send a PING command manually."""
@@ -740,6 +773,7 @@ class Sha3StressTest:
             msg += f" - {result.error}"
         
         self._log_result(msg, tag)
+        self._log_digest_result(result)
     
     def _log_result(self, msg: str, tag: Optional[str] = None) -> None:
         """Log a message to the results text widget."""
@@ -750,6 +784,42 @@ class Sha3StressTest:
             self.results_text.insert("end", msg + "\n")
         self.results_text.see("end")
         self.results_text.configure(state="disabled")
+
+    def _log_uart(self, msg: str, tag: str = "sys") -> None:
+        """Log a message to the raw UART communication widget."""
+        if not hasattr(self, "uart_text"):
+            return
+        self.uart_text.configure(state="normal")
+        self.uart_text.insert("end", msg + "\n", tag)
+        self.uart_text.see("end")
+        self.uart_text.configure(state="disabled")
+
+    def _log_digest_result(self, result: TestResult) -> None:
+        """Log expected vs actual digest details for each test."""
+        if not hasattr(self, "digest_text"):
+            return
+
+        header = f"[{result.test_num:4d}] SHA3-{result.mode} Size={result.msg_size}"
+        expected = result.expected_digest if result.expected_digest else "(not available)"
+        actual = result.actual_digest if result.actual_digest else "(not available)"
+
+        if result.success:
+            status = "MATCH"
+            status_tag = "match"
+        elif result.error and "Digest mismatch" in result.error:
+            status = "MISMATCH"
+            status_tag = "mismatch"
+        else:
+            status = f"NO_COMPARE ({result.error or 'unknown'})"
+            status_tag = "digest_info"
+
+        self.digest_text.configure(state="normal")
+        self.digest_text.insert("end", header + "\n", "digest_info")
+        self.digest_text.insert("end", f"  status: {status}\n", status_tag)
+        self.digest_text.insert("end", f"  expected: {expected}\n", "digest_info")
+        self.digest_text.insert("end", f"  actual  : {actual}\n\n", "digest_info")
+        self.digest_text.see("end")
+        self.digest_text.configure(state="disabled")
     
     def _update_stats(self) -> None:
         """Update statistics display."""
@@ -777,6 +847,14 @@ class Sha3StressTest:
         self.results_text.configure(state="normal")
         self.results_text.delete("1.0", "end")
         self.results_text.configure(state="disabled")
+
+        self.uart_text.configure(state="normal")
+        self.uart_text.delete("1.0", "end")
+        self.uart_text.configure(state="disabled")
+
+        self.digest_text.configure(state="normal")
+        self.digest_text.delete("1.0", "end")
+        self.digest_text.configure(state="disabled")
         
         self.progress_bar["value"] = 0
         self.current_test_var.set("Not started")
