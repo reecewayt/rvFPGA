@@ -2,3 +2,6 @@ __pycache__/
 build/
 *.vcd
 vivado/
+*.log
+*.jou
+vivado_project/
