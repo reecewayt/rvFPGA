@@ -3,7 +3,7 @@ vlnv: ::wb_inctercon:0
 parameters: 
   masters:
     io: 
-      slaves : [rom, sys, ptc, gpio, vga, gpio2, rgb, uart]
+      slaves : [rom, sys, ptc, gpio, gpio2, rgb, sha3, uart]
   slaves: 
     rom: 
       offset: 0x00000000
@@ -17,15 +17,15 @@ parameters:
     gpio:
       offset: 0x00001400
       size: 0x00000040
-    vga:
-      offset: 0x00001500
-      size: 0x00000040
     gpio2: 
       offset: 0x00001800
       size: 0x00000040
     rgb: 
       offset: 0x00001C00
       size: 0x00000040
+    sha3:
+      offset: 0x00001D00
+      size: 0x00000100
     uart:
       offset: 0x00002000
       size: 0x00001000

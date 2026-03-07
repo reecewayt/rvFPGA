@@ -326,6 +326,9 @@ module veerwolf_core
    assign wb_s2m_sys_err = 1'b0;
    assign wb_s2m_sys_rty = 1'b0;
 
+   // VGA/HDMI temporarily disabled for LUT reduction.
+   // Keeping this block commented preserves the original wiring for easy restore.
+   /*
    // VGA Signals
    wire hsync;
    wire vsync;
@@ -378,6 +381,13 @@ module veerwolf_core
       .TMDS_DATA_P(hdmi_tx_p),
       .TMDS_DATA_N(hdmi_tx_n)
    );
+   */
+
+   // Tie off HDMI outputs while video path is disabled.
+   assign hdmi_clk_p = 1'b0;
+   assign hdmi_clk_n = 1'b0;
+   assign hdmi_tx_p  = 3'b000;
+   assign hdmi_tx_n  = 3'b000;
 
    // GPIO - Leds and Switches
    wire [31:0] en_gpio;
@@ -592,6 +602,28 @@ module veerwolf_core
    );
 
    assign wb_s2m_rgb_rty = 1'b0;
+
+   // SHA3 accelerator
+   sha3_wb_top #(
+      .DW         (32),
+      .AW         (8),
+      .FIFO_DEPTH (64),
+      .BUFF_SIZE  (512)
+   ) sha3_accel (
+      .wb_clk_i   (clk),
+      .wb_rst_i   (wb_rst),
+      .wb_cyc_i   (wb_m2s_sha3_cyc),
+      .wb_adr_i   (wb_m2s_sha3_adr[7:0]),
+      .wb_dat_i   (wb_m2s_sha3_dat),
+      .wb_sel_i   (wb_m2s_sha3_sel),
+      .wb_we_i    (wb_m2s_sha3_we),
+      .wb_stb_i   (wb_m2s_sha3_stb),
+      .wb_dat_o   (wb_s2m_sha3_dat),
+      .wb_ack_o   (wb_s2m_sha3_ack),
+      .wb_err_o   (wb_s2m_sha3_err)
+   );
+
+   assign wb_s2m_sha3_rty = 1'b0;
 
    wire [2:0]		       valid_ip;
    wire [63:0]		       address_ip;
