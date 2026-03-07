@@ -1,0 +1,3 @@
+[submodule "extensions/sha3"]
+	path = extensions/sha3
+	url = https://github.com/reecewayt/fpga-sha3-hardware-impl.git
