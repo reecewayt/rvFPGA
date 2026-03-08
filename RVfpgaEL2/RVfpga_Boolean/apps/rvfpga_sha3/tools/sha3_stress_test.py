@@ -4,17 +4,46 @@
 import queue
 import random
 import string
+import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, scrolledtext
 from dataclasses import dataclass
 from typing import Optional
 import hashlib
+from pathlib import Path
 import re
 
 import serial
 import serial.tools.list_ports
+
+# Allow imports from parent tools/ directory when running from tools/testing/.
+TOOLS_DIR = Path(__file__).resolve().parents[1]
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from sha3_uart_protocol import ProtocolHandler
+from sha3_uart_config import (
+    CMD_ABORT,
+    CMD_DATASTR,
+    CMD_END,
+    CMD_STREAM,
+    DEFAULT_BAUD,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_FONT_FAMILY,
+    DEFAULT_LOG_FONT_SIZE,
+    DEFAULT_FONT_SIZE,
+    MAX_CHUNK_SIZE,
+    MIN_CHUNK_SIZE,
+    RESP_DATASTR_ACK,
+    RESP_HASH,
+    RESP_STREAM_START,
+    STATUS_DOT_FONT_SIZE,
+    UART_MAX_LINE_CHARS,
+    compute_max_chunk_size,
+)
 
 
 @dataclass
@@ -28,6 +57,7 @@ class TestResult:
     duration_ms: float = 0.0
     expected_digest: str = ""
     actual_digest: str = ""
+    aborted: bool = False
 
 
 class Sha3StressTest:
@@ -37,6 +67,7 @@ class Sha3StressTest:
         self.root = root
         self.root.title("RVfpga SHA3 Stress Test")
         self.root.geometry("1000x750")
+        self._apply_default_fonts()
         
         self.ser = None
         self.reader_thread = None
@@ -48,17 +79,27 @@ class Sha3StressTest:
         
         # Test state
         self.test_running = False
+        self.abort_notice_logged = False
         self.current_mode = "256"
         self.awaiting_response = False
         self.response_deadline = 0.0
         self.pending_digest_chars = ""
         self.last_response = None
         self.response_event = threading.Event()
+        self.limits_event = threading.Event()
+        self.max_uart_line_chars = UART_MAX_LINE_CHARS
+        self.max_datastr_payload_chars = MAX_CHUNK_SIZE
+        self.tx_lock = threading.Lock()
+        self.protocol: Optional[ProtocolHandler] = None
+
+        # LIMITS negotiation state
         
         # Test results
         self.results: list[TestResult] = []
         self.tests_passed = 0
         self.tests_failed = 0
+        self.bytes_sent = 0
+        self.bytes_total = 0
         
         self._build_ui()
         self._refresh_ports()
@@ -82,7 +123,7 @@ class Sha3StressTest:
         ttk.Button(conn_frame, text="Refresh", command=self._refresh_ports).grid(row=0, column=2, padx=4)
         
         ttk.Label(conn_frame, text="Baud:").grid(row=0, column=3, sticky="w", padx=(16, 0))
-        self.baud_var = tk.StringVar(value="115200")
+        self.baud_var = tk.StringVar(value=str(DEFAULT_BAUD))
         ttk.Entry(conn_frame, textvariable=self.baud_var, width=10).grid(row=0, column=4, padx=6)
         
         self.connect_btn = ttk.Button(conn_frame, text="Connect", command=self._connect)
@@ -130,17 +171,27 @@ class Sha3StressTest:
         self.timeout_var = tk.StringVar(value="15.0")
         ttk.Entry(config_frame, textvariable=self.timeout_var, width=10).grid(row=1, column=5, padx=6, pady=(8, 0))
         
+        ttk.Label(config_frame, text="Chunk Size (bytes):").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.chunk_size_var = tk.StringVar(value=str(DEFAULT_CHUNK_SIZE))
+        chunk_ctl = ttk.Frame(config_frame)
+        chunk_ctl.grid(row=2, column=1, padx=6, pady=(8, 0), sticky="w")
+        ttk.Entry(chunk_ctl, textvariable=self.chunk_size_var, width=10).grid(row=0, column=0, rowspan=2)
+        ttk.Button(chunk_ctl, text="↑", width=2, command=self._chunk_size_step_up).grid(row=0, column=1, padx=(4, 0))
+        ttk.Button(chunk_ctl, text="↓", width=2, command=self._chunk_size_step_down).grid(row=1, column=1, padx=(4, 0))
+        self.max_chunk_label = ttk.Label(config_frame, text="(max: ---)", foreground="gray")
+        self.max_chunk_label.grid(row=2, column=2, sticky="w", pady=(8, 0))
+        
         # Control buttons
         btn_frame = ttk.Frame(config_frame)
-        btn_frame.grid(row=2, column=0, columnspan=6, pady=(10, 0))
+        btn_frame.grid(row=2, column=0, columnspan=6, sticky="e", pady=(10, 0))
         
         self.start_test_btn = ttk.Button(btn_frame, text="Start Test", command=self._start_test)
-        self.start_test_btn.pack(side="left", padx=4)
+        self.start_test_btn.pack(side="right", padx=4)
         
         self.stop_test_btn = ttk.Button(btn_frame, text="Stop Test", command=self._stop_test, state="disabled")
-        self.stop_test_btn.pack(side="left", padx=4)
+        self.stop_test_btn.pack(side="right", padx=4)
         
-        ttk.Button(btn_frame, text="Clear Results", command=self._clear_results).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Clear Results", command=self._clear_results).pack(side="right", padx=4)
         
         # Progress frame
         progress_frame = ttk.LabelFrame(main_frame, text="Test Progress", padding=8)
@@ -159,6 +210,10 @@ class Sha3StressTest:
         ttk.Label(info_frame, text="Status:").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(info_frame, textvariable=self.status_var, width=60).grid(row=1, column=1, sticky="w", padx=6, pady=(4, 0))
+
+        ttk.Label(info_frame, text="Bytes Sent:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.bytes_progress_var = tk.StringVar(value="0 / 0 bytes")
+        ttk.Label(info_frame, textvariable=self.bytes_progress_var, width=60).grid(row=2, column=1, sticky="w", padx=6, pady=(4, 0))
         
         # Statistics frame
         stats_frame = ttk.LabelFrame(main_frame, text="Statistics", padding=8)
@@ -166,67 +221,76 @@ class Sha3StressTest:
         
         ttk.Label(stats_frame, text="Passed:").grid(row=0, column=0, sticky="w")
         self.passed_var = tk.StringVar(value="0")
-        ttk.Label(stats_frame, textvariable=self.passed_var, foreground="green", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(stats_frame, textvariable=self.passed_var, foreground="green", font=(DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, "bold")).grid(row=0, column=1, sticky="w", padx=6)
         
         ttk.Label(stats_frame, text="Failed:").grid(row=0, column=2, sticky="w", padx=(16, 0))
         self.failed_var = tk.StringVar(value="0")
-        ttk.Label(stats_frame, textvariable=self.failed_var, foreground="red", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=3, sticky="w", padx=6)
+        ttk.Label(stats_frame, textvariable=self.failed_var, foreground="red", font=(DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, "bold")).grid(row=0, column=3, sticky="w", padx=6)
         
         ttk.Label(stats_frame, text="Success Rate:").grid(row=0, column=4, sticky="w", padx=(16, 0))
         self.success_rate_var = tk.StringVar(value="N/A")
-        ttk.Label(stats_frame, textvariable=self.success_rate_var, font=("TkDefaultFont", 10, "bold")).grid(row=0, column=5, sticky="w", padx=6)
+        ttk.Label(stats_frame, textvariable=self.success_rate_var, font=(DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, "bold")).grid(row=0, column=5, sticky="w", padx=6)
         
         ttk.Button(stats_frame, text="Ping", command=self._send_ping).grid(row=0, column=6, sticky="w", padx=(24, 0))
         ttk.Button(stats_frame, text="Query Status", command=self._query_status_manual).grid(row=0, column=7, sticky="w", padx=4)
+        self.abort_btn = ttk.Button(stats_frame, text="Abort/Reset", command=self._abort_manual, state="disabled")
+        self.abort_btn.grid(row=0, column=8, sticky="w", padx=4)
         
-        # Live controller status frame
-        status = ttk.LabelFrame(main_frame, text="Live Controller Status", padding=8)
+        # Controller status frame
+        status = ttk.LabelFrame(main_frame, text="Controller Status", padding=8)
         status.pack(fill="x", pady=(10, 0))
         
         # FSM State row
         fsm_frame = ttk.Frame(status)
         fsm_frame.pack(fill="x", pady=2)
-        ttk.Label(fsm_frame, text="FSM:", width=10, anchor="w").pack(side="left")
-        self.status_idle = tk.Label(fsm_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(fsm_frame, text="FSM:", width=12, anchor="w").pack(side="left")
+        self.status_idle = tk.Label(fsm_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_idle.pack(side="left")
-        ttk.Label(fsm_frame, text="IDLE", width=7).pack(side="left")
-        self.status_busy = tk.Label(fsm_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(fsm_frame, text="IDLE", width=8).pack(side="left")
+        self.status_busy = tk.Label(fsm_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_busy.pack(side="left")
-        ttk.Label(fsm_frame, text="BUSY", width=7).pack(side="left")
-        self.status_done = tk.Label(fsm_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(fsm_frame, text="BUSY", width=8).pack(side="left")
+        self.status_done = tk.Label(fsm_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_done.pack(side="left")
-        ttk.Label(fsm_frame, text="DONE", width=7).pack(side="left")
+        ttk.Label(fsm_frame, text="DONE", width=8).pack(side="left")
         
         # FIFO Status row
         fifo_frame = ttk.Frame(status)
         fifo_frame.pack(fill="x", pady=2)
-        ttk.Label(fifo_frame, text="FIFO:", width=10, anchor="w").pack(side="left")
-        self.status_in_empty = tk.Label(fifo_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(fifo_frame, text="FIFO:", width=12, anchor="w").pack(side="left")
+        self.status_in_empty = tk.Label(fifo_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_in_empty.pack(side="left")
-        ttk.Label(fifo_frame, text="IN_EMPTY", width=10).pack(side="left")
-        self.status_in_full = tk.Label(fifo_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(fifo_frame, text="IN_EMPTY", width=12).pack(side="left")
+        self.status_in_full = tk.Label(fifo_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_in_full.pack(side="left")
-        ttk.Label(fifo_frame, text="IN_FULL", width=10).pack(side="left")
-        self.status_out_empty = tk.Label(fifo_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(fifo_frame, text="IN_FULL", width=12).pack(side="left")
+        self.status_out_empty = tk.Label(fifo_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_out_empty.pack(side="left")
-        ttk.Label(fifo_frame, text="OUT_EMPTY", width=10).pack(side="left")
-        self.status_out_full = tk.Label(fifo_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(fifo_frame, text="OUT_EMPTY", width=12).pack(side="left")
+        self.status_out_full = tk.Label(fifo_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_out_full.pack(side="left")
-        ttk.Label(fifo_frame, text="OUT_FULL", width=10).pack(side="left")
+        ttk.Label(fifo_frame, text="OUT_FULL", width=12).pack(side="left")
         
         # Error flags row
         err_frame = ttk.Frame(status)
         err_frame.pack(fill="x", pady=2)
-        ttk.Label(err_frame, text="Errors:", width=10, anchor="w").pack(side="left")
-        self.status_err_ill = tk.Label(err_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(err_frame, text="Errors:", width=12, anchor="w").pack(side="left")
+        self.status_err_ill = tk.Label(err_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_err_ill.pack(side="left")
-        ttk.Label(err_frame, text="ILL_WR", width=10).pack(side="left")
-        self.status_err_uf = tk.Label(err_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(err_frame, text="ILL_WR", width=12).pack(side="left")
+        self.status_err_uf = tk.Label(err_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_err_uf.pack(side="left")
-        ttk.Label(err_frame, text="UNDERFLOW", width=10).pack(side="left")
-        self.status_err_of = tk.Label(err_frame, text="●", font=("TkDefaultFont", 12), fg="gray")
+        ttk.Label(err_frame, text="UNDERFLOW", width=12).pack(side="left")
+        self.status_err_of = tk.Label(err_frame, text="●", font=(DEFAULT_FONT_FAMILY, STATUS_DOT_FONT_SIZE), fg="gray")
         self.status_err_of.pack(side="left")
-        ttk.Label(err_frame, text="OVERFLOW", width=10).pack(side="left")
+        ttk.Label(err_frame, text="OVERFLOW", width=12).pack(side="left")
+
+        # Raw status text
+        raw_frame = ttk.Frame(status)
+        raw_frame.pack(fill="x", pady=(4, 0))
+        ttk.Label(raw_frame, text="Raw:", width=12, anchor="w").pack(side="left")
+        self.status_raw_var = tk.StringVar(value="(not queried)")
+        ttk.Label(raw_frame, textvariable=self.status_raw_var, foreground="#666").pack(side="left", fill="x", expand=True)
         
         # Side-by-side log row for test results and UART trace.
         logs_row = ttk.Frame(main_frame)
@@ -239,19 +303,32 @@ class Sha3StressTest:
         results_frame = ttk.LabelFrame(logs_row, text="Test Results", padding=8)
         results_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
-        self.results_text = scrolledtext.ScrolledText(results_frame, height=15, wrap="none", state="disabled")
+        self.results_text = scrolledtext.ScrolledText(
+            results_frame,
+            height=15,
+            wrap="none",
+            state="disabled",
+            font=(DEFAULT_FONT_FAMILY, DEFAULT_LOG_FONT_SIZE),
+        )
         self.results_text.pack(fill="both", expand=True)
 
         # Configure text tags for colored output
         self.results_text.tag_config("pass", foreground="green")
         self.results_text.tag_config("fail", foreground="red")
-        self.results_text.tag_config("header", font=("TkDefaultFont", 9, "bold"))
+        self.results_text.tag_config("abort", foreground="#b36b00")
+        self.results_text.tag_config("header", font=(DEFAULT_FONT_FAMILY, DEFAULT_LOG_FONT_SIZE, "bold"))
 
-        # Raw UART frame with separate TX/RX/system trace.
-        uart_frame = ttk.LabelFrame(logs_row, text="Raw UART Communication", padding=8)
+        # UART log frame with separate TX/RX/system trace.
+        uart_frame = ttk.LabelFrame(logs_row, text="UART Log", padding=8)
         uart_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
-        self.uart_text = scrolledtext.ScrolledText(uart_frame, height=15, wrap="none", state="disabled")
+        self.uart_text = scrolledtext.ScrolledText(
+            uart_frame,
+            height=15,
+            wrap="none",
+            state="disabled",
+            font=(DEFAULT_FONT_FAMILY, DEFAULT_LOG_FONT_SIZE),
+        )
         self.uart_text.pack(fill="both", expand=True)
         self.uart_text.tag_config("tx", foreground="#1f6feb")
         self.uart_text.tag_config("rx", foreground="#0a7f2e")
@@ -262,11 +339,25 @@ class Sha3StressTest:
         digest_frame = ttk.LabelFrame(main_frame, text="Digest Comparison Log", padding=8)
         digest_frame.pack(fill="both", expand=True, pady=(10, 0))
 
-        self.digest_text = scrolledtext.ScrolledText(digest_frame, height=10, wrap="none", state="disabled")
+        self.digest_text = scrolledtext.ScrolledText(
+            digest_frame,
+            height=10,
+            wrap="none",
+            state="disabled",
+            font=(DEFAULT_FONT_FAMILY, DEFAULT_LOG_FONT_SIZE),
+        )
         self.digest_text.pack(fill="both", expand=True)
         self.digest_text.tag_config("match", foreground="green")
         self.digest_text.tag_config("mismatch", foreground="red")
         self.digest_text.tag_config("digest_info", foreground="#444444")
+
+    def _apply_default_fonts(self) -> None:
+        """Apply shared default font sizing for stable UI layout."""
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(name).configure(size=DEFAULT_FONT_SIZE)
+            except tk.TclError:
+                pass
     
     def _refresh_ports(self) -> None:
         """Refresh list of serial ports."""
@@ -285,6 +376,11 @@ class Sha3StressTest:
         try:
             baud = int(self.baud_var.get().strip())
             self.ser = serial.Serial(port, baudrate=baud, timeout=0.1)
+            self.protocol = ProtocolHandler(
+                self.ser,
+                self.tx_lock,
+                log_callback=lambda msg: self._log_uart(msg, "tx")
+            )
         except Exception as exc:
             messagebox.showerror("Connect", f"Failed to open serial port:\n{exc}")
             return
@@ -295,8 +391,13 @@ class Sha3StressTest:
         
         self.connect_btn.configure(state="disabled")
         self.disconnect_btn.configure(state="normal")
+        if hasattr(self, "abort_btn"):
+            self.abort_btn.configure(state="normal")
         self._log_result("Connected to {} @ {}".format(port, baud), "header")
         self._log_uart(f"[sys] Connected to {port} @ {baud}", "sys")
+        
+        # Query LIMITS from firmware to negotiate max chunk size
+        self._query_limits()
     
     def _disconnect(self) -> None:
         """Disconnect from serial port."""
@@ -314,6 +415,10 @@ class Sha3StressTest:
         
         self.connect_btn.configure(state="normal")
         self.disconnect_btn.configure(state="disabled")
+        if hasattr(self, "abort_btn"):
+            self.abort_btn.configure(state="disabled")
+        self.negotiated_max_chunk = None
+        self.protocol = None
         self._log_result("Disconnected", "header")
         self._log_uart("[sys] Disconnected", "sys")
         self.rx_partial.clear()
@@ -392,12 +497,32 @@ class Sha3StressTest:
             self.last_response = {"type": "pong", "data": True}
             self.response_event.set()
             self.awaiting_response = False
+        elif line.startswith("OK ABORT"):
+            self.last_response = {"type": "abort", "data": line}
+            self.response_event.set()
+            self.awaiting_response = False
+        elif line.startswith("OK LIMITS "):
+            self._parse_limits_response(line)
+            if self.protocol:
+                self.protocol.handle_limits_response(line)
+        elif line.startswith(RESP_STREAM_START):
+            self.last_response = {"type": "stream_start", "data": line}
+            self.response_event.set()
+            self.awaiting_response = False
+        elif line.startswith(RESP_DATASTR_ACK):
+            self.last_response = {"type": "datastr_ack", "data": line}
+            self.response_event.set()
+            self.awaiting_response = False
         elif line.startswith("ERR"):
             self.last_response = {"type": "error", "data": line}
             self.response_event.set()
             self.awaiting_response = False
         elif self.awaiting_response:
             self._accumulate_digest_chars(line)
+        
+        # Let protocol handler also process for synchronous operations
+        if self.protocol:
+            self.protocol.handle_response_line(line)
             
             expected_len = self._expected_digest_len()
             if len(self.pending_digest_chars) >= expected_len:
@@ -456,10 +581,128 @@ class Sha3StressTest:
     
     def _send_line(self, cmd: str) -> None:
         """Send a command to the FPGA."""
-        if not self.ser:
+        if not self.ser or not self.protocol:
             raise RuntimeError("Not connected to serial port")
-        self.ser.write((cmd + "\n").encode())
-        self._log_uart(f"-> {cmd}", "tx")
+        self.protocol.send_line(cmd)
+
+    def _query_limits(self) -> None:
+        """Query firmware for UART command buffer limits and negotiate max chunk size."""
+        def limits_worker():
+            try:
+                self.waiting_limits_response = True
+                self.limits_event.clear()
+                self._send_line("LIMITS")
+                
+                # Wait for response with timeout
+                if not self.limits_event.wait(timeout=2.0):
+                    self.root.after(0, lambda: self._log_uart("[sys] LIMITS query timeout; using default max", "sys"))
+                    self.negotiated_max_chunk = MAX_CHUNK_SIZE
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._log_uart(f"[sys] LIMITS query failed: {e}; using default", "sys"))
+                self.negotiated_max_chunk = MAX_CHUNK_SIZE
+            finally:
+                self.waiting_limits_response = False
+        
+        threading.Thread(target=limits_worker, daemon=True).start()
+
+    def _parse_limits_response(self, line: str) -> None:
+        """Parse 'OK LIMITS uart_cmd_max=N datastr_payload_max=M' and compute negotiated limit."""
+        try:
+            # Extract uart_cmd_max value
+            match = re.search(r'uart_cmd_max=(\d+)', line)
+            if match:
+                uart_cmd_max = int(match.group(1))
+                # Compute usable chunk size: reserve 1/8th for overhead
+                negotiated = compute_max_chunk_size(uart_cmd_max)
+                self.negotiated_max_chunk = negotiated
+                self._log_uart(f"[sys] LIMITS negotiated: uart_max={uart_cmd_max} -> chunk_max={negotiated}", "sys")
+                
+                # Update UI to show max chunk size
+                self.root.after(0, lambda: self.max_chunk_label.config(text=f"(max: {negotiated})"))
+                
+                if self.waiting_limits_response:
+                    self.limits_event.set()
+            else:
+                self._log_uart("[sys] LIMITS response format unrecognized; using default", "sys")
+                self.negotiated_max_chunk = MAX_CHUNK_SIZE
+                self.root.after(0, lambda: self.max_chunk_label.config(text=f"(max: {MAX_CHUNK_SIZE})"))
+        except Exception as exc:
+            self._log_uart(f"[sys] Failed to parse LIMITS: {exc}; using default", "sys")
+            self.negotiated_max_chunk = MAX_CHUNK_SIZE
+            self.root.after(0, lambda: self.max_chunk_label.config(text=f"(max: {MAX_CHUNK_SIZE})"))
+
+    def _effective_chunk_size(self) -> int:
+        try:
+            chunk_size = int(self.chunk_size_var.get())
+        except Exception:
+            chunk_size = DEFAULT_CHUNK_SIZE
+
+        if chunk_size < MIN_CHUNK_SIZE:
+            chunk_size = DEFAULT_CHUNK_SIZE
+
+        # Clamp to negotiated firmware limit (if available)
+        if self.negotiated_max_chunk is not None:
+            if chunk_size > self.negotiated_max_chunk:
+                self._log_uart(
+                    f"[sys] chunk_size={chunk_size} exceeds negotiated max={self.negotiated_max_chunk}; clamping",
+                    "sys",
+                )
+                chunk_size = self.negotiated_max_chunk
+        else:
+            # Fallback to fixed max if LIMITS not negotiated
+            if chunk_size > self.max_datastr_payload_chars:
+                self._log_uart(
+                    f"[sys] chunk_size={chunk_size} exceeds datastr_max={self.max_datastr_payload_chars}; clamping",
+                    "sys",
+                )
+                chunk_size = self.max_datastr_payload_chars
+
+        if chunk_size < MIN_CHUNK_SIZE:
+            chunk_size = MIN_CHUNK_SIZE
+        return chunk_size
+
+    def _chunk_step_max(self) -> int:
+        """Return highest power-of-two selectable size (one step above clamp limit)."""
+        max_limit = self.negotiated_max_chunk
+        if max_limit is None:
+            max_limit = self.max_datastr_payload_chars
+        max_limit = max(max_limit, MIN_CHUNK_SIZE)
+        return 1 << max_limit.bit_length()
+
+    def _set_bytes_progress(self, sent: int, total: int) -> None:
+        """Update bytes sent progress in the UI."""
+        self.bytes_sent = max(0, sent)
+        self.bytes_total = max(0, total)
+        self.bytes_progress_var.set(f"{self.bytes_sent} / {self.bytes_total} bytes")
+
+    def _chunk_size_step_up(self) -> None:
+        """Increase chunk size to next power of two within negotiated limits."""
+        try:
+            value = int(self.chunk_size_var.get())
+        except Exception:
+            value = DEFAULT_CHUNK_SIZE
+
+        value = max(value, MIN_CHUNK_SIZE)
+        is_power_of_two = value > 0 and (value & (value - 1) == 0)
+        next_value = value * 2 if is_power_of_two else (1 << value.bit_length())
+        next_value = min(next_value, self._chunk_step_max())
+        self.chunk_size_var.set(str(max(next_value, MIN_CHUNK_SIZE)))
+
+    def _chunk_size_step_down(self) -> None:
+        """Decrease chunk size to previous power of two within negotiated limits."""
+        try:
+            value = int(self.chunk_size_var.get())
+        except Exception:
+            value = DEFAULT_CHUNK_SIZE
+
+        value = max(value, MIN_CHUNK_SIZE)
+        if value <= MIN_CHUNK_SIZE:
+            self.chunk_size_var.set(str(MIN_CHUNK_SIZE))
+            return
+
+        is_power_of_two = value > 0 and (value & (value - 1) == 0)
+        next_value = value // 2 if is_power_of_two else (1 << (value.bit_length() - 1))
+        self.chunk_size_var.set(str(max(next_value, MIN_CHUNK_SIZE)))
     
     def _send_ping(self) -> None:
         """Send a PING command manually."""
@@ -502,6 +745,24 @@ class Sha3StressTest:
             self._log_result("Querying controller status...", "header")
         except Exception as exc:
             messagebox.showerror("Status", f"Failed to query status:\n{exc}")
+
+    def _abort_manual(self) -> None:
+        """Send ABORT command manually to recover from lockups."""
+        if not self.ser:
+            messagebox.showerror("Abort", "Not connected to serial port")
+            return
+        try:
+            self._send_line(CMD_ABORT)
+            self._log_result("Manual ABORT sent", "header")
+            self._log_uart("[sys] Manual ABORT sent", "sys")
+            if self.test_running:
+                self.test_stop_event.set()
+                self.status_var.set("Aborting FPGA transaction...")
+                if not self.abort_notice_logged:
+                    self._log_result("[ABORT] Test run aborted by user", "abort")
+                    self.abort_notice_logged = True
+        except Exception as exc:
+            messagebox.showerror("Abort", f"Failed to send ABORT:\n{exc}")
     
     def _parse_and_display_status(self, status_line: str) -> None:
         """Parse STATUS register hex value and update individual flag indicators."""
@@ -518,6 +779,9 @@ class Sha3StressTest:
             else:
                 status_hex = match.group(1)
                 status_val = int(status_hex, 16)
+
+            # Update raw display for parity with UART GUI
+            self.status_raw_var.set(status_line.strip())
             
             # Parse individual bits based on README register map
             # Bit 0: IDLE
@@ -561,10 +825,10 @@ class Sha3StressTest:
             self.status_err_of.config(fg="red" if err_of else "gray")
             
         except (ValueError, IndexError):
-            pass  # Silently ignore parse errors during stress test
+            self.status_raw_var.set("Parse error")
     
     def _compute_expected_digest(self, mode: str, msg: str) -> str:
-        """Compute expected digest using Python hashlib."""
+        """Compute expected digest for comparison."""
         payload = msg.encode("utf-8")
         if mode == "224":
             return hashlib.sha3_224(payload).hexdigest()
@@ -604,6 +868,7 @@ class Sha3StressTest:
             return
         
         self.test_running = True
+        self.abort_notice_logged = False
         self.test_stop_event.clear()
         self.start_test_btn.configure(state="disabled")
         self.stop_test_btn.configure(state="normal")
@@ -616,14 +881,23 @@ class Sha3StressTest:
         self.test_thread.start()
     
     def _stop_test(self) -> None:
-        """Stop the running test."""
+        """Abort active FPGA transaction and stop the running test."""
         if self.test_running:
             self.test_stop_event.set()
-            self.status_var.set("Stopping test...")
+            self.status_var.set("Aborting FPGA transaction...")
+            if not self.abort_notice_logged:
+                self._log_result("[ABORT] Test run aborted by user", "abort")
+                self.abort_notice_logged = True
+            try:
+                self._send_line(CMD_ABORT)
+                self._log_uart("[sys] ABORT sent", "sys")
+            except Exception as exc:
+                self._log_uart(f"[sys] ABORT send failed: {exc}", "uart_error")
     
     def _run_tests(self, start_size: int, end_size: int, iterations: int, timeout: float) -> None:
         """Run stress tests in background thread."""
         try:
+            aborted_run = False
             # Determine test sizes
             step_val = self.step_var.get()
             if step_val == "exponential":
@@ -648,9 +922,12 @@ class Sha3StressTest:
                 modes = [modes_sel]
             
             total_tests = len(sizes) * len(modes) * iterations
+            total_bytes = sum(sizes) * len(modes) * iterations
             test_num = 0
+            bytes_sent = 0
             
             self.progress_bar["maximum"] = total_tests
+            self.root.after(0, lambda t=total_bytes: self._set_bytes_progress(0, t))
             
             for mode in modes:
                 if self.test_stop_event.is_set():
@@ -675,6 +952,7 @@ class Sha3StressTest:
                         
                         test_num += 1
                         msg = self._generate_random_message(size)
+                        msg_bytes = len(msg.encode("utf-8"))
                         
                         self.root.after(
                             0,
@@ -685,6 +963,7 @@ class Sha3StressTest:
                         start_time = time.time()
                         success, error, actual_digest = self._run_single_test(mode, msg, timeout)
                         duration_ms = (time.time() - start_time) * 1000
+                        aborted = (error == "ABORTED")
                         
                         expected_digest = self._compute_expected_digest(mode, msg) if success or error else ""
                         
@@ -696,12 +975,15 @@ class Sha3StressTest:
                             error=error,
                             duration_ms=duration_ms,
                             expected_digest=expected_digest,
-                            actual_digest=actual_digest
+                            actual_digest=actual_digest,
+                            aborted=aborted,
                         )
                         
                         self.results.append(result)
                         
-                        if success:
+                        if aborted:
+                            aborted_run = True
+                        elif success:
                             self.tests_passed += 1
                         else:
                             self.tests_failed += 1
@@ -709,10 +991,25 @@ class Sha3StressTest:
                         self.root.after(0, lambda r=result: self._display_result(r))
                         self.root.after(0, lambda: self._update_stats())
                         self.root.after(0, lambda v=test_num: self.progress_bar.configure(value=v))
+                        if not aborted:
+                            bytes_sent += msg_bytes
+                        self.root.after(0, lambda s=bytes_sent, t=total_bytes: self._set_bytes_progress(s, t))
+
+                        if aborted:
+                            break
                         
                         time.sleep(0.05)  # Small delay between tests
+
+                    if aborted_run:
+                        break
+
+                if aborted_run:
+                    break
             
-            self.root.after(0, lambda: self.status_var.set("Test completed!"))
+            if self.test_stop_event.is_set() or aborted_run:
+                self.root.after(0, lambda: self.status_var.set("Test aborted"))
+            else:
+                self.root.after(0, lambda: self.status_var.set("Test completed!"))
             
         except Exception as exc:
             self.root.after(0, lambda e=str(exc): self.status_var.set(f"Test error: {e}"))
@@ -726,26 +1023,51 @@ class Sha3StressTest:
     def _run_single_test(self, mode: str, msg: str, timeout: float) -> tuple[bool, Optional[str], str]:
         """Run a single test and return (success, error, actual_digest)."""
         try:
-            # Send HASH command
-            if not self._wait_for_response(lambda: self._send_line(f"HASH {msg}"), timeout):
-                return False, "Timeout waiting for response", ""
+            if self.test_stop_event.is_set():
+                return False, "ABORTED", ""
+
+            if not self.protocol:
+                return False, "Protocol handler not initialized", ""
+
+            # Use STREAM/DATASTR/END protocol to avoid sending huge single-line commands.
+            payload = msg
+
+            # DATASTR is line-based and cannot carry raw newlines safely.
+            if "\n" in payload or "\r" in payload:
+                return False, "Payload contains newline/carriage return; unsupported by DATASTR", ""
+
+            chunk_size = self._effective_chunk_size()
+
+            # Use protocol handler for proper DATASTR ACK waiting
+            success, error_msg = self.protocol.send_stream_data(
+                payload,
+                chunk_size,
+                timeout=timeout,
+                abort_check=lambda: self.test_stop_event.is_set()
+            )
             
-            if self.last_response["type"] == "error":
-                return False, self.last_response["data"], ""
-            
-            if self.last_response["type"] == "timeout":
-                return False, "Timeout", ""
-            
-            if self.last_response["type"] != "hash":
-                return False, f"Unexpected response type: {self.last_response['type']}", ""
-            
-            actual_digest = self.last_response["data"]
+            if not success:
+                return False, error_msg, ""
+
+            # Get the hash digest from the last response
+            if self.protocol.last_response is None:
+                return False, "No response after END", ""
+
+            if self.protocol.last_response.get("type") == "abort":
+                return False, "ABORTED", ""
+
+            if self.protocol.last_response.get("type") == "error":
+                return False, self.protocol.last_response.get("data", "Unknown error"), ""
+
+            if self.protocol.last_response.get("type") != "hash":
+                return False, f"Unexpected response type: {self.protocol.last_response.get('type')}", ""
+
+            actual_digest = self.protocol.last_response["data"]
             expected_digest = self._compute_expected_digest(mode, msg)
-            
             if actual_digest == expected_digest:
                 return True, None, actual_digest
             else:
-                return False, f"Digest mismatch", actual_digest
+                return False, "Digest mismatch", actual_digest
             
         except Exception as exc:
             return False, str(exc), ""
@@ -757,15 +1079,37 @@ class Sha3StressTest:
         self.awaiting_response = True
         self.response_deadline = time.time() + timeout
         self.pending_digest_chars = ""
-        
+        # Flush any pending input that could contaminate the next response
+        if self.ser:
+            try:
+                # pyserial: discard any received bytes in the OS/kernel buffer
+                self.ser.reset_input_buffer()
+            except Exception:
+                pass
+
+        # Clear any partially-accumulated data in our local buffers/queues
+        try:
+            self.rx_partial.clear()
+        except Exception:
+            pass
+        while True:
+            try:
+                self.rx_queue.get_nowait()
+            except queue.Empty:
+                break
+
         send_func()
-        
+
         return self.response_event.wait(timeout + 0.5)
     
     def _display_result(self, result: TestResult) -> None:
         """Display a test result."""
-        status = "PASS" if result.success else "FAIL"
-        tag = "pass" if result.success else "fail"
+        if result.aborted:
+            status = "ABORT"
+            tag = "abort"
+        else:
+            status = "PASS" if result.success else "FAIL"
+            tag = "pass" if result.success else "fail"
         
         msg = f"[{result.test_num:4d}] SHA3-{result.mode} Size={result.msg_size:5d} {status:4s} ({result.duration_ms:6.1f}ms)"
         
@@ -786,7 +1130,7 @@ class Sha3StressTest:
         self.results_text.configure(state="disabled")
 
     def _log_uart(self, msg: str, tag: str = "sys") -> None:
-        """Log a message to the raw UART communication widget."""
+        """Log a message to the UART log widget."""
         if not hasattr(self, "uart_text"):
             return
         self.uart_text.configure(state="normal")
@@ -859,6 +1203,7 @@ class Sha3StressTest:
         self.progress_bar["value"] = 0
         self.current_test_var.set("Not started")
         self.status_var.set("Idle")
+        self._set_bytes_progress(0, 0)
     
     def _on_close(self) -> None:
         """Handle window close event."""
