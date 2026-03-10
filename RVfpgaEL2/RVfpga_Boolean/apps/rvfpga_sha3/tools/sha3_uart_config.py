@@ -10,17 +10,18 @@ CMD_DATASTR = "DATASTR"
 CMD_END = "END"
 CMD_ABORT = "ABORT"
 
-# UART command line buffer sizing in firmware (`main.c`).
-UART_CMD_MAX_LEN = 65536
-UART_MAX_LINE_CHARS = UART_CMD_MAX_LEN - 1
-
 # Expected positive response prefixes
 RESP_STREAM_START = "OK STREAM START"
 RESP_DATASTR_ACK = "OK DATASTR"
 RESP_HASH = "OK HASH"
 
+# Streaming mode selection
+STREAM_MODE_LINE_BASED = "line"      # Line-based DATASTR <len>:<text>
+STREAM_MODE_BINARY = "binary"        # Raw binary after STREAM
+DEFAULT_STREAM_MODE = STREAM_MODE_LINE_BASED  # Start with line-based for compatibility
+
 # Default chunk size used by both GUI tools (characters/bytes for ASCII payloads).
-# Keep this less than UART_CMD_MAX_LEN in firmware after including command prefix.
+# Must remain below the negotiated DATASTR payload max from LIMITS.
 DEFAULT_CHUNK_SIZE = 8192
 
 # Conservative minimum accepted chunk size from UI
@@ -31,18 +32,26 @@ MAX_CHUNK_SIZE = 16 * 1024
 
 
 def compute_max_chunk_size(uart_cmd_max: int) -> int:
-    """Compute maximum usable chunk size from firmware's UART command buffer limit.
-    
-    Reserves 1/8th of the buffer for command overhead (DATASTR prefix, length field, etc.)
-    and returns 7/8ths as the maximum payload size.
-    
-    Args:
-        uart_cmd_max: Maximum UART command line length from firmware (UART_CMD_MAX_LEN)
-    
-    Returns:
-        Maximum chunk size for DATASTR payloads (bytes)
+    """Compute max DATASTR payload size for a given UART command buffer limit.
+
+    Uses the same exact budgeting as firmware:
+    command format is "DATASTR <len>:<payload>" and line parsing allows at most
+    `uart_cmd_max - 1` characters before the newline terminator.
     """
-    return (uart_cmd_max * 7) // 8
+    max_line_chars = max(0, uart_cmd_max - 1)
+    fixed_chars = 9  # "DATASTR " + ':'
+
+    payload_max = max_line_chars - fixed_chars
+    if payload_max <= 0:
+        return 0
+
+    while payload_max > 0:
+        digits = len(str(payload_max))
+        if fixed_chars + digits + payload_max <= max_line_chars:
+            return payload_max
+        payload_max -= 1
+
+    return 0
 
 
 # UI font defaults (shared by both GUI tools)

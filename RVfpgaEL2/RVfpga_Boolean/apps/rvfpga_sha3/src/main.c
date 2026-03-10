@@ -60,6 +60,9 @@ static void print_hex_u32(uint32_t w) {
 /* Reduced because large messages are now streamed via STREAM/DATASTR/END */
 #define UART_CMD_MAX_LEN       32768u
 
+/* DATASTR line format: "DATASTR <len>:<payload>" */
+#define DATASTR_FIXED_CHARS    9u   /* "DATASTR " + ':' */
+
 /* SHA3 completion wait budget: base + (bytes * slope), saturated at UINT32 max. */
 #define SHA3_WAIT_BASE_CYCLES      40000000u
 #define SHA3_WAIT_PER_BYTE_CYCLES  20000u
@@ -177,12 +180,14 @@ static uint64_t stream_expected_len = 0ull;
 static uint64_t stream_received = 0ull;
 static uint8_t stream_partial[4];
 static size_t stream_partial_len = 0u;
+static int stream_binary_mode = 0;  /* 1 if waiting for raw binary data, 0 if expecting DATASTR commands */
 
 static void stream_reset_state(void) {
     stream_active = 0;
     stream_expected_len = 0ull;
     stream_received = 0ull;
     stream_partial_len = 0u;
+    stream_binary_mode = 0;
 }
 
 /* Helper: write arbitrary bytes into SHA3 input using 32-bit big-endian packing */
@@ -324,7 +329,7 @@ static size_t decimal_digits_u64(uint64_t value) {
 
 static size_t uart_max_datastr_payload_len(void) {
     const size_t max_line_chars = UART_CMD_MAX_LEN - 1u;
-    const size_t fixed_chars = 9u; /* "DATASTR " + ':' */
+    const size_t fixed_chars = DATASTR_FIXED_CHARS;
     size_t payload_max = (max_line_chars > fixed_chars) ? (max_line_chars - fixed_chars) : 0u;
 
     while (payload_max > 0u) {
@@ -369,6 +374,17 @@ static int uart_read_line(char *out, size_t max_len) {
             truncated = 1;
         }
     }
+}
+
+/* Read binary data directly from UART (no line parsing) */
+static int uart_read_binary(uint8_t *out, size_t len) {
+    size_t n = 0u;
+    while (n < len) {
+        while ((UART_LINE_STATUS & UART_LSR_DR) == 0u) {
+        }
+        out[n++] = (uint8_t)(UART_RX_DATA & 0xFFu);
+    }
+    return 0;
 }
 
 static void print_digest(const uint32_t *digest, uint32_t count) {
@@ -449,8 +465,8 @@ int main(void) {
         }
 
         /* STREAM <len> - begin streaming a message of <len> bytes into the SHA3 engine
-         * DATASTR <text-chunk> - send raw text bytes as a chunk. Multiple DATASTR commands
-         *                        will be concatenated.
+         * DATASTR <len>:<text-chunk> - send a validated text chunk. Multiple DATASTR
+         *                              commands will be concatenated.
          * END - finish streaming and compute hash.
          */
         if (starts_with_ci(line, "STREAM")) {
@@ -472,8 +488,16 @@ int main(void) {
                 continue;
             }
 
+            /* Check if BINARY mode is requested */
+            const char *mode_arg = skip_spaces(endptr);
+            int use_binary = 0;
+            if (starts_with_ci(mode_arg, "BINARY")) {
+                use_binary = 1;
+            }
+
             /* initialize streaming state */
             stream_active = 1;
+            stream_binary_mode = use_binary;
             stream_expected_len = (uint64_t)len;
             stream_received = 0ull;
             stream_partial_len = 0u;
@@ -484,7 +508,25 @@ int main(void) {
             sha3_set_msglen(stream_expected_len);
             sha3_start();
 
-            printfNexys("OK STREAM START len=%lu\n", (unsigned long)stream_expected_len);
+            if (use_binary) {
+                /* Send acknowledgment before reading binary data */
+                printfNexys("OK STREAM BINARY ready=%lu\n", (unsigned long)stream_expected_len);
+                
+                /* In binary mode, read raw data directly without waiting for DATASTR commands */
+                uint8_t binary_buffer[256];
+                while (stream_received < stream_expected_len) {
+                    uint64_t remaining = stream_expected_len - stream_received;
+                    size_t to_read = (remaining > (uint64_t)sizeof(binary_buffer)) ? sizeof(binary_buffer) : (size_t)remaining;
+                    
+                    uart_read_binary(binary_buffer, to_read);
+                    sha3_stream_write_bytes(binary_buffer, to_read);
+                }
+                
+                /* Binary data reception complete; stream_active stays 1 so END can finalize */
+                stream_binary_mode = 0;
+            } else {
+                printfNexys("OK STREAM START len=%lu\n", (unsigned long)stream_expected_len);
+            }
             continue;
         }
 
@@ -498,9 +540,7 @@ int main(void) {
                 continue;
             }
 
-            /* Preferred format: DATASTR <len>:<raw-text>
-             * Keep legacy DATASTR <raw-text> support for compatibility.
-             */
+            /* Format: DATASTR <len>:<raw-text> */
             arg = skip_spaces(arg);
             if (*arg == '\0') {
                 printfNexys("ERR DATASTR no bytes parsed\n");
@@ -510,23 +550,22 @@ int main(void) {
             {
                 char *endptr = NULL;
                 unsigned long long declared_len = strtoull(arg, &endptr, 10);
-                if (endptr != arg && *endptr == ':') {
-                    data_ptr = endptr + 1;
-                    bi = strlen(data_ptr);
-                    if (declared_len != (unsigned long long)bi) {
-                        printfNexys("ERR DATASTR length mismatch declared=%lu actual=%lu\n",
-                                    (unsigned long)declared_len,
-                                    (unsigned long)bi);
-                        sha3_reset();
-                        stream_reset_state();
-                        continue;
-                    }
-                } else {
-                    data_ptr = line + 7;
-                    if (*data_ptr == ' ') {
-                        data_ptr++;
-                    }
-                    bi = strlen(data_ptr);
+                if (endptr == arg || *endptr != ':') {
+                    printfNexys("ERR DATASTR invalid format (expected <len>:<text>)\n");
+                    sha3_reset();
+                    stream_reset_state();
+                    continue;
+                }
+                
+                data_ptr = endptr + 1;
+                bi = strlen(data_ptr);
+                if (declared_len != (unsigned long long)bi) {
+                    printfNexys("ERR DATASTR length mismatch declared=%lu actual=%lu\n",
+                                (unsigned long)declared_len,
+                                (unsigned long)bi);
+                    sha3_reset();
+                    stream_reset_state();
+                    continue;
                 }
             }
 

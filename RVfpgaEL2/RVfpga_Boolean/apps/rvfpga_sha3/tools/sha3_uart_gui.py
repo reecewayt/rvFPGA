@@ -9,27 +9,24 @@ import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 import hashlib
 import re
+from typing import Optional
 
 import serial
 import serial.tools.list_ports
 from sha3_uart_protocol import ProtocolHandler
 from sha3_uart_config import (
     CMD_ABORT,
-    CMD_DATASTR,
-    CMD_END,
-    CMD_STREAM,
     DEFAULT_BAUD,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_FONT_FAMILY,
     DEFAULT_FONT_SIZE,
     DEFAULT_LOG_FONT_SIZE,
+    DEFAULT_STREAM_MODE,
     MAX_CHUNK_SIZE,
     MIN_CHUNK_SIZE,
     RESP_DATASTR_ACK,
-    RESP_HASH,
     RESP_STREAM_START,
     STATUS_DOT_FONT_SIZE,
-    UART_MAX_LINE_CHARS,
     compute_max_chunk_size,
 )
 
@@ -57,7 +54,6 @@ class Sha3UartGui:
         self.stream_ack_error = None
         self.poll_after_id = None
         self.tx_lock = threading.Lock()
-        self.max_uart_line_chars = UART_MAX_LINE_CHARS
         self.max_datastr_payload_chars = MAX_CHUNK_SIZE
         self.protocol: Optional[ProtocolHandler] = None
         
@@ -123,6 +119,16 @@ class Sha3UartGui:
         ttk.Label(flow_left, text="Timeout (s):").pack(side="left")
         self.timeout_var = tk.StringVar(value="15.0")
         ttk.Entry(flow_left, textvariable=self.timeout_var, width=8).pack(side="left", padx=(6, 16))
+
+        ttk.Label(flow_left, text="Stream Mode:").pack(side="left")
+        self.stream_mode_var = tk.StringVar(value=DEFAULT_STREAM_MODE)
+        ttk.Combobox(
+            flow_left,
+            textvariable=self.stream_mode_var,
+            values=["line", "binary"],
+            width=10,
+            state="readonly"
+        ).pack(side="left", padx=(6, 16))
 
         ttk.Label(flow_left, text="SHA3 Modes:").pack(side="left")
         ttk.Combobox(
@@ -248,7 +254,8 @@ class Sha3UartGui:
             self.protocol = ProtocolHandler(
                 self.ser, 
                 self.tx_lock,
-                log_callback=lambda msg: self._log(msg, "tx")
+                log_callback=lambda msg: self._log(msg, "tx"),
+                stream_mode=self.stream_mode_var.get()
             )
         except Exception as exc:  # pylint: disable=broad-except
             messagebox.showerror("Connect", f"Failed to open serial port:\n{exc}")
@@ -528,14 +535,20 @@ class Sha3UartGui:
     def _parse_limits_response(self, line: str) -> None:
         """Parse 'OK LIMITS uart_cmd_max=N datastr_payload_max=M' and compute negotiated limit."""
         try:
-            # Extract uart_cmd_max value
-            match = re.search(r'uart_cmd_max=(\d+)', line)
-            if match:
-                uart_cmd_max = int(match.group(1))
-                # Compute usable chunk size: reserve 1/8th for overhead
+            datastr_match = re.search(r'datastr_payload_max=(\d+)', line)
+            uart_match = re.search(r'uart_cmd_max=(\d+)', line)
+
+            if datastr_match:
+                negotiated = int(datastr_match.group(1))
+            elif uart_match:
+                uart_cmd_max = int(uart_match.group(1))
                 negotiated = compute_max_chunk_size(uart_cmd_max)
+            else:
+                negotiated = None
+
+            if negotiated is not None:
                 self.negotiated_max_chunk = negotiated
-                self._log(f"[gui] LIMITS negotiated: uart_max={uart_cmd_max} -> chunk_max={negotiated}", "sys")
+                self._log(f"[gui] LIMITS negotiated: chunk_max={negotiated}", "sys")
                 
                 # Update UI to show max chunk size
                 self.root.after(0, lambda: self.max_chunk_label.config(text=f"(max: {negotiated})"))
@@ -706,6 +719,9 @@ class Sha3UartGui:
                     return
 
                 chunk_size = self._effective_chunk_size()
+                
+                # Update stream mode before each operation (allows mode changes without reconnect)
+                self.protocol.set_stream_mode(self.stream_mode_var.get())
                 
                 # Use protocol handler for proper DATASTR ACK waiting
                 success, error_msg = self.protocol.send_stream_data(

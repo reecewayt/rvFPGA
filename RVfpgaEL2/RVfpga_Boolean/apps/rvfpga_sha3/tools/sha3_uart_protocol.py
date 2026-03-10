@@ -12,21 +12,19 @@ from sha3_uart_config import (
     CMD_STREAM,
     CMD_DATASTR,
     CMD_END,
-    RESP_STREAM_START,
     RESP_DATASTR_ACK,
+    STREAM_MODE_LINE_BASED,
+    STREAM_MODE_BINARY,
+    DEFAULT_STREAM_MODE,
     compute_max_chunk_size,
 )
 
 
 @dataclass
 class HashRateMetrics:
-    """Hash rate metrics for a single operation (STREAM -> END cycle).
-    
-    Tracks timing from the initial STREAM command to the final hash response,
-    along with the data size processed.
-    """
-    data_size_bytes: int = 0          # Total bytes of data sent
-    duration_seconds: float = 0.0     # Total time from STREAM to hash response
+    """Communication metrics for a single stream transfer."""
+    data_size_bytes: int = 0
+    duration_seconds: float = 0.0
     
     @property
     def hash_rate_bytes_sec(self) -> float:
@@ -45,23 +43,17 @@ class HashRateMetrics:
 class HashRateAccumulator:
     """Accumulates hash rate metrics across multiple operations.
     
-    Provides global statistics across all test runs while tracking individual
-    operation metrics. Thread-safe for concurrent access.
+    Thread-safe for concurrent access.
     """
     
     def __init__(self):
-        """Initialize accumulator."""
         self.lock = threading.Lock()
         self.operations: list[HashRateMetrics] = []
         self.total_data_bytes = 0
         self.total_duration_seconds = 0.0
     
     def add_operation(self, metrics: HashRateMetrics) -> None:
-        """Record a completed operation.
-        
-        Args:
-            metrics: HashRateMetrics instance for the operation
-        """
+        """Record a completed operation."""
         with self.lock:
             self.operations.append(metrics)
             self.total_data_bytes += metrics.data_size_bytes
@@ -69,13 +61,13 @@ class HashRateAccumulator:
     
     @property
     def operation_count(self) -> int:
-        """Get number of recorded operations."""
+        """Number of recorded operations."""
         with self.lock:
             return len(self.operations)
     
     @property
     def global_hash_rate_bytes_sec(self) -> float:
-        """Get global hash rate across all operations."""
+        """Global hash rate across all operations (bytes/sec)."""
         with self.lock:
             if self.total_duration_seconds <= 0:
                 return 0.0
@@ -83,7 +75,7 @@ class HashRateAccumulator:
     
     @property
     def average_duration_seconds(self) -> float:
-        """Get average operation duration."""
+        """Average operation duration (seconds)."""
         with self.lock:
             if not self.operations:
                 return 0.0
@@ -91,18 +83,14 @@ class HashRateAccumulator:
     
     @property
     def average_data_size_bytes(self) -> float:
-        """Get average data size per operation."""
+        """Average data size per operation (bytes)."""
         with self.lock:
             if not self.operations:
                 return 0.0
             return self.total_data_bytes / len(self.operations)
     
     def get_summary(self) -> str:
-        """Get formatted summary of all metrics.
-        
-        Returns:
-            Multi-line summary string with operation count, totals, and rates
-        """
+        """Get formatted summary of all metrics."""
         with self.lock:
             if not self.operations:
                 return "No operations recorded"
@@ -118,11 +106,7 @@ class HashRateAccumulator:
             return summary
     
     def get_last_operation_metrics(self) -> Optional[HashRateMetrics]:
-        """Get metrics from the most recent operation.
-        
-        Returns:
-            HashRateMetrics from last operation, or None if no operations
-        """
+        """Get metrics from the most recent operation."""
         with self.lock:
             if not self.operations:
                 return None
@@ -140,68 +124,51 @@ class ProtocolHandler:
     """Common protocol handling for UART communication with SHA3 firmware."""
     
     def __init__(self, ser: serial.Serial, tx_lock: threading.Lock, 
-                 log_callback: Optional[Callable[[str], None]] = None):
+                 log_callback: Optional[Callable[[str], None]] = None,
+                 stream_mode: str = DEFAULT_STREAM_MODE):
         """Initialize protocol handler.
         
         Args:
             ser: Serial port instance
-            tx_lock: Thread lock for serial transmission
-            log_callback: Optional callback for logging TX messages (called with formatted message)
+            tx_lock: Thread lock for transmissions
+            log_callback: Optional callback for logging (receives formatted message)
+            stream_mode: "line" (DATASTR chunks) or "binary" (raw bytes)
         """
         self.ser = ser
         self.tx_lock = tx_lock
         self.log_callback = log_callback
+        self.stream_mode = stream_mode
         
-        # Response tracking for synchronous operations
         self.response_event = threading.Event()
         self.last_response: Optional[dict[str, Any]] = None
         self.awaiting_response = False
-        self.response_deadline = 0.0
         
-        # UART burst throttling parameters
-        self.uart_delay_threshold = 100  # Start throttling above this size
-        self.uart_burst_size = 16        # Bytes per burst
-        self.uart_burst_delay_ms = 2     # Delay between bursts
-        
-        # Hash rate metrics tracking
         self.metrics_accumulator = HashRateAccumulator()
-        self.current_operation_start_time: Optional[float] = None
     
-    def send_line(self, cmd: str) -> None:
-        """Send a command line to the UART with burst throttling.
+    def set_stream_mode(self, mode: str) -> None:
+        """Update streaming mode without reconnecting.
         
         Args:
-            cmd: Command string (without newline)
+            mode: "line" or "binary"
         """
+        self.stream_mode = mode
+    
+    def send_line(self, cmd: str) -> None:
+        """Send a command line (adds newline and flushes)."""
         with self.tx_lock:
-            if len(cmd) > self.uart_delay_threshold:
-                cmd_bytes = cmd.encode()
-                for i in range(0, len(cmd_bytes), self.uart_burst_size):
-                    burst = cmd_bytes[i:i + self.uart_burst_size]
-                    self.ser.write(burst)
-                    if i + self.uart_burst_size < len(cmd_bytes):
-                        time.sleep(self.uart_burst_delay_ms / 1000.0)
-                self.ser.write(b"\n")
-            else:
-                self.ser.write((cmd + "\n").encode())
+            self.ser.write((cmd + "\n").encode())
+            self.ser.flush()
         
-        # Log transmitted command
         if self.log_callback:
             self.log_callback(f"-> {cmd[:80]}{'...' if len(cmd) > 80 else ''}")
     
     def wait_for_response(self, send_func: Callable[[], None], timeout: float) -> bool:
-        """Send a command and wait for firmware response.
+        """Send command and wait for firmware response.
         
-        Args:
-            send_func: Function to call to send the command
-            timeout: Maximum wait time in seconds
-        
-        Returns:
-            True if response received within timeout, False otherwise
+        Returns True if response received within timeout.
         """
         self.response_event.clear()
         self.awaiting_response = True
-        self.response_deadline = time.time() + timeout
         
         send_func()
         
@@ -210,18 +177,14 @@ class ProtocolHandler:
         return received
     
     def handle_response_line(self, line: str) -> bool:
-        """Process a received line and update response state.
+        """Process received line and update response state.
         
-        Args:
-            line: Received line from firmware
-        
-        Returns:
-            True if this line was a response (sets response_event), False otherwise
+        Returns True if line was recognized as a response.
         """
         if not self.awaiting_response:
             return False
         
-        # Check for various response types
+        # Check for response types and set event
         if "OK HASH" in line.upper():
             # Extract digest if present
             digest = self._extract_digest_from_line(line)
@@ -244,7 +207,8 @@ class ProtocolHandler:
             self.last_response = {"type": "abort", "data": line}
             self.response_event.set()
             return True
-        elif line.startswith(RESP_STREAM_START):
+        elif line.startswith("OK STREAM"):
+            # Handles "OK STREAM START" and "OK STREAM BINARY_DATA_RECEIVED"
             self.last_response = {"type": "stream_start", "data": line}
             self.response_event.set()
             return True
@@ -268,32 +232,34 @@ class ProtocolHandler:
         else:
             tail = line.strip()
         
-        # Extract hex characters
+        # Extract consecutive hex characters
         hex_chars = ''.join(c for c in tail if c in '0123456789abcdefABCDEF')
         if len(hex_chars) >= 56:  # Minimum for SHA3-224
             return hex_chars
         return None
     
     def send_stream_data(self, payload: str, chunk_size: int, timeout: float,
-                         abort_check: Optional[Callable[[], bool]] = None) -> tuple[bool, str]:
-        """Send data using STREAM/DATASTR/END protocol with ACK flow control.
+                         abort_check: Optional[Callable[[], bool]] = None,
+                         progress_callback: Optional[Callable[[int], None]] = None) -> tuple[bool, str]:
+        """Send data using configured streaming mode.
         
-        Automatically collects hash rate metrics for the operation.
-        
-        Args:
-            payload: Message payload to send
-            chunk_size: Maximum chunk size in bytes
-            timeout: Timeout for each command response
-            abort_check: Optional function that returns True if operation should abort
-        
-        Returns:
-            Tuple of (success: bool, error_message: str)
+        Dispatches to line-based or binary implementation based on stream_mode.
+        Returns (success: bool, error_message: str).
         """
-        # Start timing the operation (from STREAM command)
-        operation_start_time = time.time()
-        self.current_operation_start_time = operation_start_time
+        if self.stream_mode == STREAM_MODE_BINARY:
+            return self.send_stream_data_binary(payload, timeout, abort_check, progress_callback)
+        else:
+            return self.send_stream_data_line(payload, chunk_size, timeout, abort_check, progress_callback)
+    
+    def send_stream_data_line(self, payload: str, chunk_size: int, timeout: float,
+                              abort_check: Optional[Callable[[], bool]] = None,
+                              progress_callback: Optional[Callable[[int], None]] = None) -> tuple[bool, str]:
+        """Send data using STREAM/DATASTR/END protocol with per-chunk ACK.
         
+        Returns (success: bool, error_message: str).
+        """
         total_len = len(payload.encode("utf-8"))
+        comm_start_time = time.time()
         
         # Send STREAM command
         if not self.wait_for_response(lambda: self.send_line(f"{CMD_STREAM} {total_len}"), timeout):
@@ -310,6 +276,12 @@ class ProtocolHandler:
         if self.last_response and self.last_response.get("type") != "stream_start":
             return False, f"Unexpected STREAM response: {self.last_response.get('type')}"
         
+        # Progress tracking for throttled updates
+        bytes_sent = 0
+        last_progress_time = time.time()
+        progress_update_interval = 0.1  # 100ms
+        progress_byte_threshold = 10240  # 10KB
+
         # Send DATASTR chunks with per-chunk ACK
         idx = 0
         while idx < len(payload):
@@ -336,6 +308,17 @@ class ProtocolHandler:
             if self.last_response and self.last_response.get("type") == "error":
                 return False, self.last_response.get("data", "DATASTR error")
             
+            bytes_sent += chunk_len
+            
+            # Update progress (throttled to 100ms or 10KB intervals)
+            current_time = time.time()
+            if progress_callback and (
+                (current_time - last_progress_time >= progress_update_interval) or
+                (bytes_sent >= progress_byte_threshold)
+            ):
+                progress_callback(bytes_sent)
+                last_progress_time = current_time
+            
             idx += take
         
         # Send END command
@@ -356,10 +339,101 @@ class ProtocolHandler:
         if self.last_response.get("type") != "hash":
             return False, f"Expected hash, got: {self.last_response.get('type')}"
         
-        # Record operation metrics (from STREAM to hash response)
-        operation_end_time = time.time()
-        duration = operation_end_time - operation_start_time
-        metrics = HashRateMetrics(data_size_bytes=total_len, duration_seconds=duration)
+        # Send final progress update
+        if progress_callback:
+            progress_callback(total_len)
+
+        # Record full communication round-trip metrics (send + receive hash).
+        comm_duration = max(0.0, time.time() - comm_start_time)
+        metrics = HashRateMetrics(data_size_bytes=total_len, duration_seconds=comm_duration)
+        self.metrics_accumulator.add_operation(metrics)
+        
+        return True, ""
+    
+    def send_stream_data_binary(self, payload: str, timeout: float,
+                                abort_check: Optional[Callable[[], bool]] = None,
+                                progress_callback: Optional[Callable[[int], None]] = None) -> tuple[bool, str]:
+        """Send data using binary streaming (raw bytes after STREAM BINARY).
+        
+        Protocol: STREAM <len> BINARY → raw bytes → END → hash response
+        Returns (success: bool, error_message: str).
+        """
+        payload_bytes = payload.encode("utf-8")
+        total_len = len(payload_bytes)
+        comm_start_time = time.time()
+
+        # Send STREAM BINARY command
+        if not self.wait_for_response(lambda: self.send_line(f"{CMD_STREAM} {total_len} BINARY"), timeout):
+            if abort_check and abort_check():
+                return False, "ABORTED"
+            return False, "Timeout in STREAM BINARY command"
+        
+        if self.last_response and self.last_response.get("type") == "abort":
+            return False, "ABORTED"
+        
+        if self.last_response and self.last_response.get("type") == "error":
+            return False, f"STREAM BINARY failed: {self.last_response.get('data')}"
+        
+        # Send raw binary data with progress updates
+        with self.tx_lock:
+            try:
+                if abort_check and abort_check():
+                    return False, "ABORTED"
+                
+                # Small payloads: send directly
+                if total_len <= 10240:
+                    self.ser.write(payload_bytes)
+                    self.ser.flush()
+                    if progress_callback:
+                        progress_callback(total_len)
+                else:
+                    # Large payloads: send in chunks with throttled progress updates
+                    chunk_size = 10240
+                    bytes_sent = 0
+                    last_progress_time = time.time()
+                    progress_update_interval = 0.1
+                    
+                    for i in range(0, total_len, chunk_size):
+                        if abort_check and abort_check():
+                            return False, "ABORTED"
+                        
+                        chunk = payload_bytes[i:i + chunk_size]
+                        self.ser.write(chunk)
+                        bytes_sent += len(chunk)
+
+                        # Update progress (throttled to 100ms intervals)
+                        current_time = time.time()
+                        if progress_callback and (current_time - last_progress_time >= progress_update_interval):
+                            progress_callback(bytes_sent)
+                            last_progress_time = current_time
+                    
+                    self.ser.flush()
+                    if progress_callback:
+                        progress_callback(total_len)
+            except Exception as e:
+                return False, f"Error sending binary data: {str(e)}"
+        
+        # Send END command
+        if not self.wait_for_response(lambda: self.send_line(CMD_END), timeout):
+            if abort_check and abort_check():
+                return False, "ABORTED"
+            return False, "Timeout waiting for END/hash"
+        
+        if self.last_response is None:
+            return False, "No response after END"
+        
+        if self.last_response.get("type") == "abort":
+            return False, "ABORTED"
+        
+        if self.last_response.get("type") == "error":
+            return False, self.last_response.get("data", "END error")
+        
+        if self.last_response.get("type") != "hash":
+            return False, f"Expected hash, got: {self.last_response.get('type')}"
+
+        # Record full communication round-trip metrics (send + receive hash).
+        comm_duration = max(0.0, time.time() - comm_start_time)
+        metrics = HashRateMetrics(data_size_bytes=total_len, duration_seconds=comm_duration)
         self.metrics_accumulator.add_operation(metrics)
         
         return True, ""
@@ -367,20 +441,21 @@ class ProtocolHandler:
     def query_limits(self, timeout: float = 2.0) -> Optional[int]:
         """Query firmware LIMITS and return negotiated max chunk size.
         
-        Args:
-            timeout: Timeout for LIMITS query
-        
-        Returns:
-            Negotiated max chunk size in bytes, or None if negotiation failed
+        Returns max chunk size in bytes, or None if negotiation failed.
         """
         if not self.wait_for_response(lambda: self.send_line("LIMITS"), timeout):
             return None
         
         if not self.last_response or self.last_response.get("type") != "limits":
             return None
-        
-        # Parse uart_cmd_max from response data
+
+        # Prefer exact datastr_payload_max reported by firmware
         line = self.last_response.get("data", "")
+        datastr_match = re.search(r'datastr_payload_max=(\d+)', line)
+        if datastr_match:
+            return int(datastr_match.group(1))
+
+        # Fallback: derive from uart_cmd_max using host-side calculation
         match = re.search(r'uart_cmd_max=(\d+)', line)
         if not match:
             return None
@@ -389,14 +464,7 @@ class ProtocolHandler:
         return compute_max_chunk_size(uart_cmd_max)
     
     def handle_limits_response(self, line: str) -> bool:
-        """Handle LIMITS response line.
-        
-        Args:
-            line: Response line starting with "OK LIMITS"
-        
-        Returns:
-            True if handled as LIMITS response
-        """
+        """Handle LIMITS response line. Returns True if handled."""
         if not line.startswith("OK LIMITS "):
             return False
         

@@ -27,21 +27,17 @@ if str(TOOLS_DIR) not in sys.path:
 from sha3_uart_protocol import ProtocolHandler
 from sha3_uart_config import (
     CMD_ABORT,
-    CMD_DATASTR,
-    CMD_END,
-    CMD_STREAM,
     DEFAULT_BAUD,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_FONT_FAMILY,
     DEFAULT_LOG_FONT_SIZE,
     DEFAULT_FONT_SIZE,
+    DEFAULT_STREAM_MODE,
     MAX_CHUNK_SIZE,
     MIN_CHUNK_SIZE,
     RESP_DATASTR_ACK,
-    RESP_HASH,
     RESP_STREAM_START,
     STATUS_DOT_FONT_SIZE,
-    UART_MAX_LINE_CHARS,
     compute_max_chunk_size,
 )
 
@@ -88,7 +84,6 @@ class Sha3StressTest:
         self.last_response = None
         self.response_event = threading.Event()
         self.limits_event = threading.Event()
-        self.max_uart_line_chars = UART_MAX_LINE_CHARS
         self.max_datastr_payload_chars = MAX_CHUNK_SIZE
         self.tx_lock = threading.Lock()
         self.protocol: Optional[ProtocolHandler] = None
@@ -101,6 +96,7 @@ class Sha3StressTest:
         self.tests_failed = 0
         self.bytes_sent = 0
         self.bytes_total = 0
+        self.bytes_sent_before_current = 0  # Cumulative bytes from completed tests
         
         self._build_ui()
         self._refresh_ports()
@@ -153,6 +149,16 @@ class Sha3StressTest:
             width=12,
             state="readonly"
         ).grid(row=0, column=5, padx=6)
+
+        ttk.Label(config_frame, text="Chunk Size (bytes):").grid(row=0, column=6, sticky="w", padx=(16, 0))
+        self.chunk_size_var = tk.StringVar(value=str(DEFAULT_CHUNK_SIZE))
+        chunk_ctl = ttk.Frame(config_frame)
+        chunk_ctl.grid(row=0, column=7, padx=6, sticky="w")
+        ttk.Entry(chunk_ctl, textvariable=self.chunk_size_var, width=10).grid(row=0, column=0, rowspan=2)
+        ttk.Button(chunk_ctl, text="↑", width=2, command=self._chunk_size_step_up).grid(row=0, column=1, padx=(4, 0))
+        ttk.Button(chunk_ctl, text="↓", width=2, command=self._chunk_size_step_down).grid(row=1, column=1, padx=(4, 0))
+        self.max_chunk_label = ttk.Label(config_frame, text="(max: ---)", foreground="gray")
+        self.max_chunk_label.grid(row=0, column=8, sticky="w")
         
         ttk.Label(config_frame, text="Iterations per size:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.iterations_var = tk.StringVar(value="3")
@@ -172,27 +178,16 @@ class Sha3StressTest:
         self.timeout_var = tk.StringVar(value="15.0")
         ttk.Entry(config_frame, textvariable=self.timeout_var, width=10).grid(row=1, column=5, padx=6, pady=(8, 0))
         
-        ttk.Label(config_frame, text="Chunk Size (bytes):").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.chunk_size_var = tk.StringVar(value=str(DEFAULT_CHUNK_SIZE))
-        chunk_ctl = ttk.Frame(config_frame)
-        chunk_ctl.grid(row=2, column=1, padx=6, pady=(8, 0), sticky="w")
-        ttk.Entry(chunk_ctl, textvariable=self.chunk_size_var, width=10).grid(row=0, column=0, rowspan=2)
-        ttk.Button(chunk_ctl, text="↑", width=2, command=self._chunk_size_step_up).grid(row=0, column=1, padx=(4, 0))
-        ttk.Button(chunk_ctl, text="↓", width=2, command=self._chunk_size_step_down).grid(row=1, column=1, padx=(4, 0))
-        self.max_chunk_label = ttk.Label(config_frame, text="(max: ---)", foreground="gray")
-        self.max_chunk_label.grid(row=2, column=2, sticky="w", pady=(8, 0))
-        
-        # Control buttons
-        btn_frame = ttk.Frame(config_frame)
-        btn_frame.grid(row=2, column=0, columnspan=6, sticky="e", pady=(10, 0))
-        
-        self.start_test_btn = ttk.Button(btn_frame, text="Start Test", command=self._start_test)
-        self.start_test_btn.pack(side="right", padx=4)
-        
-        self.stop_test_btn = ttk.Button(btn_frame, text="Stop Test", command=self._stop_test, state="disabled")
-        self.stop_test_btn.pack(side="right", padx=4)
-        
-        ttk.Button(btn_frame, text="Clear Results", command=self._clear_results).pack(side="right", padx=4)
+        # Stream mode selector
+        ttk.Label(config_frame, text="Stream Mode:").grid(row=1, column=6, sticky="w", padx=(16, 0), pady=(8, 0))
+        self.stream_mode_var = tk.StringVar(value=DEFAULT_STREAM_MODE)
+        ttk.Combobox(
+            config_frame,
+            textvariable=self.stream_mode_var,
+            values=["line", "binary"],
+            width=10,
+            state="readonly"
+        ).grid(row=1, column=7, padx=6, pady=(8, 0))
         
         # Progress frame
         progress_frame = ttk.LabelFrame(main_frame, text="Test Progress", padding=8)
@@ -215,6 +210,20 @@ class Sha3StressTest:
         ttk.Label(info_frame, text="Bytes Sent:").grid(row=2, column=0, sticky="w", pady=(4, 0))
         self.bytes_progress_var = tk.StringVar(value="0 / 0 bytes")
         ttk.Label(info_frame, textvariable=self.bytes_progress_var, width=60).grid(row=2, column=1, sticky="w", padx=6, pady=(4, 0))
+
+        # Test control buttons (bottom-right of progress panel)
+        progress_btn_frame = ttk.Frame(progress_frame)
+        progress_btn_frame.pack(fill="x", pady=(8, 0))
+        btn_right = ttk.Frame(progress_btn_frame)
+        btn_right.pack(side="right")
+
+        self.start_test_btn = ttk.Button(btn_right, text="Start Test", command=self._start_test)
+        self.start_test_btn.pack(side="left", padx=4)
+
+        self.stop_test_btn = ttk.Button(btn_right, text="Stop Test", command=self._stop_test, state="disabled")
+        self.stop_test_btn.pack(side="left", padx=4)
+
+        ttk.Button(btn_right, text="Clear Results", command=self._clear_results).pack(side="left", padx=4)
         
         # Statistics frame
         stats_frame = ttk.LabelFrame(main_frame, text="Statistics", padding=8)
@@ -380,7 +389,8 @@ class Sha3StressTest:
             self.protocol = ProtocolHandler(
                 self.ser,
                 self.tx_lock,
-                log_callback=lambda msg: self._log_uart(msg, "tx")
+                log_callback=lambda msg: self._log_uart(msg, "tx"),
+                stream_mode=self.stream_mode_var.get()
             )
         except Exception as exc:
             messagebox.showerror("Connect", f"Failed to open serial port:\n{exc}")
@@ -609,14 +619,20 @@ class Sha3StressTest:
     def _parse_limits_response(self, line: str) -> None:
         """Parse 'OK LIMITS uart_cmd_max=N datastr_payload_max=M' and compute negotiated limit."""
         try:
-            # Extract uart_cmd_max value
-            match = re.search(r'uart_cmd_max=(\d+)', line)
-            if match:
-                uart_cmd_max = int(match.group(1))
-                # Compute usable chunk size: reserve 1/8th for overhead
+            datastr_match = re.search(r'datastr_payload_max=(\d+)', line)
+            uart_match = re.search(r'uart_cmd_max=(\d+)', line)
+
+            if datastr_match:
+                negotiated = int(datastr_match.group(1))
+            elif uart_match:
+                uart_cmd_max = int(uart_match.group(1))
                 negotiated = compute_max_chunk_size(uart_cmd_max)
+            else:
+                negotiated = None
+
+            if negotiated is not None:
                 self.negotiated_max_chunk = negotiated
-                self._log_uart(f"[sys] LIMITS negotiated: uart_max={uart_cmd_max} -> chunk_max={negotiated}", "sys")
+                self._log_uart(f"[sys] LIMITS negotiated: chunk_max={negotiated}", "sys")
                 
                 # Update UI to show max chunk size
                 self.root.after(0, lambda: self.max_chunk_label.config(text=f"(max: {negotiated})"))
@@ -961,9 +977,9 @@ class Sha3StressTest:
                             self.current_test_var.set(f"Test {t}/{total_tests}: SHA3-{m}, Size={s}, Iter={i+1}/{iterations}")
                         )
                         
-                        start_time = time.time()
+                        self.bytes_sent_before_current = bytes_sent
                         success, error, actual_digest, hash_rate = self._run_single_test(mode, msg, timeout)
-                        duration_ms = (time.time() - start_time) * 1000
+                        duration_ms = (msg_bytes / hash_rate * 1000.0) if hash_rate > 0 else 0.0
                         aborted = (error == "ABORTED")
                         
                         expected_digest = self._compute_expected_digest(mode, msg) if success or error else ""
@@ -1043,18 +1059,30 @@ class Sha3StressTest:
 
             chunk_size = self._effective_chunk_size()
 
+            # Update stream mode before each operation (allows mode changes without reconnect)
+            self.protocol.set_stream_mode(self.stream_mode_var.get())
+
+            # Progress callback for live byte counter updates
+            def on_progress(current_bytes: int):
+                total_current = self.bytes_sent_before_current + current_bytes
+                self.root.after(0, lambda: self._set_bytes_progress(total_current, self.bytes_total))
+
+            pre_op_count = self.protocol.metrics_accumulator.operation_count
+
             # Use protocol handler for proper DATASTR ACK waiting
             success, error_msg = self.protocol.send_stream_data(
                 payload,
                 chunk_size,
                 timeout=timeout,
-                abort_check=lambda: self.test_stop_event.is_set()
+                abort_check=lambda: self.test_stop_event.is_set(),
+                progress_callback=on_progress
             )
             
             # Get hash rate metrics from protocol
             hash_rate = 0.0
+            post_op_count = self.protocol.metrics_accumulator.operation_count
             last_metrics = self.protocol.metrics_accumulator.get_last_operation_metrics()
-            if last_metrics:
+            if post_op_count > pre_op_count and last_metrics:
                 hash_rate = last_metrics.hash_rate_bytes_sec
             
             if not success:
