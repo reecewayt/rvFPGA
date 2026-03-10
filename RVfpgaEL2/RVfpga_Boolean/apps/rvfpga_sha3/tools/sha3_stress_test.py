@@ -58,6 +58,7 @@ class TestResult:
     expected_digest: str = ""
     actual_digest: str = ""
     aborted: bool = False
+    hash_rate_bytes_sec: float = 0.0  # Hash rate for this individual test
 
 
 class Sha3StressTest:
@@ -961,7 +962,7 @@ class Sha3StressTest:
                         )
                         
                         start_time = time.time()
-                        success, error, actual_digest = self._run_single_test(mode, msg, timeout)
+                        success, error, actual_digest, hash_rate = self._run_single_test(mode, msg, timeout)
                         duration_ms = (time.time() - start_time) * 1000
                         aborted = (error == "ABORTED")
                         
@@ -977,6 +978,7 @@ class Sha3StressTest:
                             expected_digest=expected_digest,
                             actual_digest=actual_digest,
                             aborted=aborted,
+                            hash_rate_bytes_sec=hash_rate,
                         )
                         
                         self.results.append(result)
@@ -1020,21 +1022,24 @@ class Sha3StressTest:
             self.root.after(0, lambda: self.start_test_btn.configure(state="normal"))
             self.root.after(0, lambda: self.stop_test_btn.configure(state="disabled"))
     
-    def _run_single_test(self, mode: str, msg: str, timeout: float) -> tuple[bool, Optional[str], str]:
-        """Run a single test and return (success, error, actual_digest)."""
+    def _run_single_test(self, mode: str, msg: str, timeout: float) -> tuple[bool, Optional[str], str, float]:
+        """Run a single test and return (success, error, actual_digest, hash_rate_bytes_sec).
+        
+        Automatically collects hash rate metrics from the protocol handler.
+        """
         try:
             if self.test_stop_event.is_set():
-                return False, "ABORTED", ""
+                return False, "ABORTED", "", 0.0
 
             if not self.protocol:
-                return False, "Protocol handler not initialized", ""
+                return False, "Protocol handler not initialized", "", 0.0
 
             # Use STREAM/DATASTR/END protocol to avoid sending huge single-line commands.
             payload = msg
 
             # DATASTR is line-based and cannot carry raw newlines safely.
             if "\n" in payload or "\r" in payload:
-                return False, "Payload contains newline/carriage return; unsupported by DATASTR", ""
+                return False, "Payload contains newline/carriage return; unsupported by DATASTR", "", 0.0
 
             chunk_size = self._effective_chunk_size()
 
@@ -1046,31 +1051,37 @@ class Sha3StressTest:
                 abort_check=lambda: self.test_stop_event.is_set()
             )
             
+            # Get hash rate metrics from protocol
+            hash_rate = 0.0
+            last_metrics = self.protocol.metrics_accumulator.get_last_operation_metrics()
+            if last_metrics:
+                hash_rate = last_metrics.hash_rate_bytes_sec
+            
             if not success:
-                return False, error_msg, ""
+                return False, error_msg, "", hash_rate
 
             # Get the hash digest from the last response
             if self.protocol.last_response is None:
-                return False, "No response after END", ""
+                return False, "No response after END", "", hash_rate
 
             if self.protocol.last_response.get("type") == "abort":
-                return False, "ABORTED", ""
+                return False, "ABORTED", "", hash_rate
 
             if self.protocol.last_response.get("type") == "error":
-                return False, self.protocol.last_response.get("data", "Unknown error"), ""
+                return False, self.protocol.last_response.get("data", "Unknown error"), "", hash_rate
 
             if self.protocol.last_response.get("type") != "hash":
-                return False, f"Unexpected response type: {self.protocol.last_response.get('type')}", ""
+                return False, f"Unexpected response type: {self.protocol.last_response.get('type')}", "", hash_rate
 
             actual_digest = self.protocol.last_response["data"]
             expected_digest = self._compute_expected_digest(mode, msg)
             if actual_digest == expected_digest:
-                return True, None, actual_digest
+                return True, None, actual_digest, hash_rate
             else:
-                return False, "Digest mismatch", actual_digest
+                return False, "Digest mismatch", actual_digest, hash_rate
             
         except Exception as exc:
-            return False, str(exc), ""
+            return False, str(exc), "", 0.0
     
     def _wait_for_response(self, send_func, timeout: float) -> bool:
         """Wait for a response from the device."""
@@ -1111,7 +1122,10 @@ class Sha3StressTest:
             status = "PASS" if result.success else "FAIL"
             tag = "pass" if result.success else "fail"
         
-        msg = f"[{result.test_num:4d}] SHA3-{result.mode} Size={result.msg_size:5d} {status:4s} ({result.duration_ms:6.1f}ms)"
+        # Format hash rate if available
+        hash_rate_str = f" @ {result.hash_rate_bytes_sec:.1f} B/s" if result.hash_rate_bytes_sec > 0 else ""
+        
+        msg = f"[{result.test_num:4d}] SHA3-{result.mode} Size={result.msg_size:5d} {status:4s} ({result.duration_ms:6.1f}ms){hash_rate_str}"
         
         if not result.success and result.error:
             msg += f" - {result.error}"
@@ -1186,6 +1200,11 @@ class Sha3StressTest:
         self.results.clear()
         self.tests_passed = 0
         self.tests_failed = 0
+        
+        # Reset metrics accumulator
+        if self.protocol:
+            self.protocol.metrics_accumulator.reset()
+        
         self._update_stats()
         
         self.results_text.configure(state="normal")

@@ -5,6 +5,7 @@ import threading
 import time
 import re
 from typing import Optional, Callable, Any
+from dataclasses import dataclass
 import serial
 
 from sha3_uart_config import (
@@ -15,6 +16,124 @@ from sha3_uart_config import (
     RESP_DATASTR_ACK,
     compute_max_chunk_size,
 )
+
+
+@dataclass
+class HashRateMetrics:
+    """Hash rate metrics for a single operation (STREAM -> END cycle).
+    
+    Tracks timing from the initial STREAM command to the final hash response,
+    along with the data size processed.
+    """
+    data_size_bytes: int = 0          # Total bytes of data sent
+    duration_seconds: float = 0.0     # Total time from STREAM to hash response
+    
+    @property
+    def hash_rate_bytes_sec(self) -> float:
+        """Calculate hash rate in bytes per second."""
+        if self.duration_seconds <= 0:
+            return 0.0
+        return self.data_size_bytes / self.duration_seconds
+    
+    def __str__(self) -> str:
+        """Format metrics as human-readable string."""
+        if self.hash_rate_bytes_sec == 0:
+            return f"{self.data_size_bytes} bytes in {self.duration_seconds:.3f}s (rate: N/A)"
+        return f"{self.data_size_bytes} bytes in {self.duration_seconds:.3f}s @ {self.hash_rate_bytes_sec:.2f} B/s"
+
+
+class HashRateAccumulator:
+    """Accumulates hash rate metrics across multiple operations.
+    
+    Provides global statistics across all test runs while tracking individual
+    operation metrics. Thread-safe for concurrent access.
+    """
+    
+    def __init__(self):
+        """Initialize accumulator."""
+        self.lock = threading.Lock()
+        self.operations: list[HashRateMetrics] = []
+        self.total_data_bytes = 0
+        self.total_duration_seconds = 0.0
+    
+    def add_operation(self, metrics: HashRateMetrics) -> None:
+        """Record a completed operation.
+        
+        Args:
+            metrics: HashRateMetrics instance for the operation
+        """
+        with self.lock:
+            self.operations.append(metrics)
+            self.total_data_bytes += metrics.data_size_bytes
+            self.total_duration_seconds += metrics.duration_seconds
+    
+    @property
+    def operation_count(self) -> int:
+        """Get number of recorded operations."""
+        with self.lock:
+            return len(self.operations)
+    
+    @property
+    def global_hash_rate_bytes_sec(self) -> float:
+        """Get global hash rate across all operations."""
+        with self.lock:
+            if self.total_duration_seconds <= 0:
+                return 0.0
+            return self.total_data_bytes / self.total_duration_seconds
+    
+    @property
+    def average_duration_seconds(self) -> float:
+        """Get average operation duration."""
+        with self.lock:
+            if not self.operations:
+                return 0.0
+            return self.total_duration_seconds / len(self.operations)
+    
+    @property
+    def average_data_size_bytes(self) -> float:
+        """Get average data size per operation."""
+        with self.lock:
+            if not self.operations:
+                return 0.0
+            return self.total_data_bytes / len(self.operations)
+    
+    def get_summary(self) -> str:
+        """Get formatted summary of all metrics.
+        
+        Returns:
+            Multi-line summary string with operation count, totals, and rates
+        """
+        with self.lock:
+            if not self.operations:
+                return "No operations recorded"
+            
+            summary = (
+                f"Operations: {len(self.operations)}\n"
+                f"Total Data: {self.total_data_bytes} bytes\n"
+                f"Total Time: {self.total_duration_seconds:.3f}s\n"
+                f"Global Rate: {self.global_hash_rate_bytes_sec:.2f} B/s\n"
+                f"Avg Data/Op: {self.average_data_size_bytes:.1f} bytes\n"
+                f"Avg Time/Op: {self.average_duration_seconds:.3f}s"
+            )
+            return summary
+    
+    def get_last_operation_metrics(self) -> Optional[HashRateMetrics]:
+        """Get metrics from the most recent operation.
+        
+        Returns:
+            HashRateMetrics from last operation, or None if no operations
+        """
+        with self.lock:
+            if not self.operations:
+                return None
+            return self.operations[-1]
+    
+    def reset(self) -> None:
+        """Clear all recorded metrics."""
+        with self.lock:
+            self.operations.clear()
+            self.total_data_bytes = 0
+            self.total_duration_seconds = 0.0
 
 
 class ProtocolHandler:
@@ -43,6 +162,10 @@ class ProtocolHandler:
         self.uart_delay_threshold = 100  # Start throttling above this size
         self.uart_burst_size = 16        # Bytes per burst
         self.uart_burst_delay_ms = 2     # Delay between bursts
+        
+        # Hash rate metrics tracking
+        self.metrics_accumulator = HashRateAccumulator()
+        self.current_operation_start_time: Optional[float] = None
     
     def send_line(self, cmd: str) -> None:
         """Send a command line to the UART with burst throttling.
@@ -155,6 +278,8 @@ class ProtocolHandler:
                          abort_check: Optional[Callable[[], bool]] = None) -> tuple[bool, str]:
         """Send data using STREAM/DATASTR/END protocol with ACK flow control.
         
+        Automatically collects hash rate metrics for the operation.
+        
         Args:
             payload: Message payload to send
             chunk_size: Maximum chunk size in bytes
@@ -164,6 +289,10 @@ class ProtocolHandler:
         Returns:
             Tuple of (success: bool, error_message: str)
         """
+        # Start timing the operation (from STREAM command)
+        operation_start_time = time.time()
+        self.current_operation_start_time = operation_start_time
+        
         total_len = len(payload.encode("utf-8"))
         
         # Send STREAM command
@@ -226,6 +355,12 @@ class ProtocolHandler:
         
         if self.last_response.get("type") != "hash":
             return False, f"Expected hash, got: {self.last_response.get('type')}"
+        
+        # Record operation metrics (from STREAM to hash response)
+        operation_end_time = time.time()
+        duration = operation_end_time - operation_start_time
+        metrics = HashRateMetrics(data_size_bytes=total_len, duration_seconds=duration)
+        self.metrics_accumulator.add_operation(metrics)
         
         return True, ""
     
