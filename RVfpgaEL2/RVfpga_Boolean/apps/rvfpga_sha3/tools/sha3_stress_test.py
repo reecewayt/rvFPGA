@@ -63,7 +63,12 @@ class Sha3StressTest:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("RVfpga SHA3 Stress Test")
-        self.root.geometry("1000x750")
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        default_w = max(1000, min(1300, int(screen_w * 0.82)))
+        default_h = max(820, min(980, int(screen_h * 0.86)))
+        self.root.geometry(f"{default_w}x{default_h}")
+        self.root.minsize(1000, 820)
         self._apply_default_fonts()
         
         self.ser = None
@@ -302,9 +307,11 @@ class Sha3StressTest:
         self.status_raw_var = tk.StringVar(value="(not queried)")
         ttk.Label(raw_frame, textvariable=self.status_raw_var, foreground="#666").pack(side="left", fill="x", expand=True)
         
-        # Side-by-side log row for test results and UART trace.
-        logs_row = ttk.Frame(main_frame)
-        logs_row.pack(fill="both", expand=True, pady=(10, 0))
+        # Resizable lower section: top = test/UART logs, bottom = digest comparison.
+        lower_pane = ttk.Panedwindow(main_frame, orient="vertical")
+        lower_pane.pack(fill="both", expand=True, pady=(10, 0))
+
+        logs_row = ttk.Frame(lower_pane)
         logs_row.columnconfigure(0, weight=1)
         logs_row.columnconfigure(1, weight=1)
         logs_row.rowconfigure(0, weight=1)
@@ -346,8 +353,7 @@ class Sha3StressTest:
         self.uart_text.tag_config("sys", foreground="#666666")
 
         # Digest comparison frame for detailed expected vs actual logging.
-        digest_frame = ttk.LabelFrame(main_frame, text="Digest Comparison Log", padding=8)
-        digest_frame.pack(fill="both", expand=True, pady=(10, 0))
+        digest_frame = ttk.LabelFrame(lower_pane, text="Digest Comparison Log", padding=8)
 
         self.digest_text = scrolledtext.ScrolledText(
             digest_frame,
@@ -360,6 +366,9 @@ class Sha3StressTest:
         self.digest_text.tag_config("match", foreground="green")
         self.digest_text.tag_config("mismatch", foreground="red")
         self.digest_text.tag_config("digest_info", foreground="#444444")
+
+        lower_pane.add(logs_row, weight=3)
+        lower_pane.add(digest_frame, weight=2)
 
     def _apply_default_fonts(self) -> None:
         """Apply shared default font sizing for stable UI layout."""

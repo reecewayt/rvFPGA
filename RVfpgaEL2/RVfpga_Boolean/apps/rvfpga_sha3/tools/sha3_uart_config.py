@@ -56,6 +56,6 @@ def compute_max_chunk_size(uart_cmd_max: int) -> int:
 
 # UI font defaults (shared by both GUI tools)
 DEFAULT_FONT_FAMILY = "TkDefaultFont"
-DEFAULT_FONT_SIZE = 18
-STATUS_DOT_FONT_SIZE = 18
-DEFAULT_LOG_FONT_SIZE = 18
+DEFAULT_FONT_SIZE = 16
+STATUS_DOT_FONT_SIZE = 16
+DEFAULT_LOG_FONT_SIZE = 16
