@@ -1,5 +1,34 @@
 #!/usr/bin/env python3
-"""Stress testing tool for SHA3 UART interface with incremental message sizes."""
+"""
+sha3_stress_test.py - SHA3 UART stress-testing GUI for RVfpga.
+
+    Authors: Copilot and Truong Le (tnl3@pdx.edu)
+
+How this script works:
+1) Connects to UART and negotiates LIMITS for maximum safe chunk size.
+2) Builds a test matrix across message sizes, SHA3 modes, and iterations.
+3) For each case, sends MODE, streams payload (line/binary), receives digest,
+   compares against local hashlib reference, and records pass/fail + metrics.
+4) Aggregates throughput statistics and renders result/UART/digest logs.
+
+Configurable runtime options (UI):
+- Serial port + baud rate.
+- Start/end message size, step policy (exponential/fixed), iterations.
+- SHA3 mode selection (single mode or all modes).
+- Stream mode (line/binary), chunk size, timeout.
+
+Class overview:
+- TestResult: immutable-style container for one executed test case.
+- Sha3StressTest: orchestrates connection, test scheduling, execution, logging,
+  and statistics presentation.
+  - Connection: _connect, _disconnect.
+  - Execution: _start_test, _run_tests, _run_single_test, _stop_test.
+  - RX/protocol hooks: _handle_rx_line, _prepare_response_wait.
+  - Reporting: _display_result, _update_stats, _clear_results.
+  
+Note: This code was generated using Copilot using prompting.
+  
+"""
 
 import queue
 import random
@@ -8,23 +37,17 @@ import sys
 import threading
 import time
 import tkinter as tk
-import tkinter.font as tkfont
 from tkinter import ttk, messagebox, scrolledtext
 from dataclasses import dataclass
 from typing import Optional
-import hashlib
 from pathlib import Path
-import re
-
-import serial
-import serial.tools.list_ports
 
 # Allow imports from parent tools/ directory when running from tools/testing/.
 TOOLS_DIR = Path(__file__).resolve().parents[1]
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from sha3_uart_protocol import ProtocolHandler
+from sha3_uart_protocol import ProtocolHandler, Sha3GUIBase
 from sha3_uart_config import (
     CMD_ABORT,
     DEFAULT_BAUD,
@@ -34,17 +57,15 @@ from sha3_uart_config import (
     DEFAULT_FONT_SIZE,
     DEFAULT_STREAM_MODE,
     MAX_CHUNK_SIZE,
-    MIN_CHUNK_SIZE,
     RESP_DATASTR_ACK,
     RESP_STREAM_START,
     STATUS_DOT_FONT_SIZE,
-    compute_max_chunk_size,
 )
 
 
 @dataclass
 class TestResult:
-    """Single test result."""
+    """Single executed stress-test record used by UI result renderers."""
     test_num: int
     mode: str
     msg_size: int
@@ -57,8 +78,8 @@ class TestResult:
     hash_rate_bytes_sec: float = 0.0  # Hash rate for this individual test
 
 
-class Sha3StressTest:
-    """Stress test GUI for SHA3 FPGA accelerator."""
+class Sha3StressTest(Sha3GUIBase):
+    """GUI harness that runs repeated SHA3 protocol transactions and scoring."""
     
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -69,6 +90,7 @@ class Sha3StressTest:
         default_h = max(820, min(980, int(screen_h * 0.86)))
         self.root.geometry(f"{default_w}x{default_h}")
         self.root.minsize(1000, 820)
+        self.default_font_size = DEFAULT_FONT_SIZE
         self._apply_default_fonts()
         
         self.ser = None
@@ -88,12 +110,12 @@ class Sha3StressTest:
         self.pending_digest_chars = ""
         self.last_response = None
         self.response_event = threading.Event()
-        self.limits_event = threading.Event()
         self.max_datastr_payload_chars = MAX_CHUNK_SIZE
         self.tx_lock = threading.Lock()
         self.protocol: Optional[ProtocolHandler] = None
 
         # LIMITS negotiation state
+        self.negotiated_max_chunk = None
         
         # Test results
         self.results: list[TestResult] = []
@@ -370,115 +392,31 @@ class Sha3StressTest:
         lower_pane.add(logs_row, weight=3)
         lower_pane.add(digest_frame, weight=2)
 
-    def _apply_default_fonts(self) -> None:
-        """Apply shared default font sizing for stable UI layout."""
-        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
-            try:
-                tkfont.nametofont(name).configure(size=DEFAULT_FONT_SIZE)
-            except tk.TclError:
-                pass
-    
-    def _refresh_ports(self) -> None:
-        """Refresh list of serial ports."""
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.port_combo["values"] = ports
-        if ports and not self.port_var.get():
-            self.port_var.set(ports[0])
-    
     def _connect(self) -> None:
         """Connect to serial port."""
-        port = self.port_var.get().strip()
-        if not port:
-            messagebox.showerror("Connect", "Select a serial port first")
+        connection = self._connect_with_protocol(lambda msg: self._log_uart(msg, "tx"))
+        if not connection:
             return
-        
-        try:
-            baud = int(self.baud_var.get().strip())
-            self.ser = serial.Serial(port, baudrate=baud, timeout=0.1)
-            self.protocol = ProtocolHandler(
-                self.ser,
-                self.tx_lock,
-                log_callback=lambda msg: self._log_uart(msg, "tx"),
-                stream_mode=self.stream_mode_var.get()
-            )
-        except Exception as exc:
-            messagebox.showerror("Connect", f"Failed to open serial port:\n{exc}")
-            return
-        
-        self.stop_event.clear()
-        self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self.reader_thread.start()
-        
-        self.connect_btn.configure(state="disabled")
-        self.disconnect_btn.configure(state="normal")
-        if hasattr(self, "abort_btn"):
-            self.abort_btn.configure(state="normal")
+
+        port, baud = connection
         self._log_result("Connected to {} @ {}".format(port, baud), "header")
         self._log_uart(f"[sys] Connected to {port} @ {baud}", "sys")
-        
-        # Query LIMITS from firmware to negotiate max chunk size
-        self._query_limits()
     
     def _disconnect(self) -> None:
         """Disconnect from serial port."""
-        self.stop_event.set()
-        
-        if self.reader_thread and self.reader_thread.is_alive():
-            self.reader_thread.join(timeout=0.5)
-        
-        if self.ser:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-            self.ser = None
-        
-        self.connect_btn.configure(state="normal")
-        self.disconnect_btn.configure(state="disabled")
-        if hasattr(self, "abort_btn"):
-            self.abort_btn.configure(state="disabled")
-        self.negotiated_max_chunk = None
-        self.protocol = None
+        self._post_disconnect_cleanup()
         self._log_result("Disconnected", "header")
         self._log_uart("[sys] Disconnected", "sys")
-        self.rx_partial.clear()
-    
-    def _reader_loop(self) -> None:
-        """Background thread for reading serial data."""
-        while not self.stop_event.is_set():
-            if not self.ser:
-                time.sleep(0.05)
-                continue
-            try:
-                n = self.ser.in_waiting or 1
-                data = self.ser.read(n)
-                if data:
-                    self.rx_partial.extend(data)
-                    while b"\n" in self.rx_partial:
-                        raw, _, rest = self.rx_partial.partition(b"\n")
-                        self.rx_partial = bytearray(rest)
-                        line = raw.decode(errors="replace").rstrip("\r")
-                        self.rx_queue.put(line)
-            except Exception as exc:
-                self.rx_queue.put(f"[error] Serial read error: {exc}")
-                break
-    
-    def _poll_rx_queue(self) -> None:
-        """Poll receive queue and handle responses."""
-        while True:
-            try:
-                line = self.rx_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_rx_line(line)
-        
-        # Check for timeout
+
+    def _poll_interval_ms(self) -> int:
+        return 50
+
+    def _handle_poll_timeout(self) -> None:
+        """Poll-time timeout handling for stress test command waits."""
         if self.awaiting_response and time.time() > self.response_deadline:
             self.awaiting_response = False
             self.last_response = {"type": "timeout", "data": None}
             self.response_event.set()
-        
-        self.poll_after_id = self.root.after(50, self._poll_rx_queue)
     
     def _handle_rx_line(self, line: str) -> None:
         """Handle a received line from UART."""
@@ -492,55 +430,76 @@ class Sha3StressTest:
             self.response_event.set()
             return
         
+        """
+        Message Commands:
+        - OK HASH <digest>: retrieve hash from controller (can be multi-line if long, so may require accumulation)
+        - OK MODE <mode>: echoes the mode that was set 
+        - OK STATUS <hex>: sends current controller status in hex
+        - OK PONG: response to PING command
+        - OK ABORT: response to ABORT command, may include additional info
+        - OK LIMITS <json>: response to LIMITS query with max chunk size and other parameters
+        - ERR <error message>: indicates an error response from the controller
+        - "RESP_STREAM_START": indicates the controller is ready to receive a data stream (after MODE command)
+        - "RESP_DATASTR_ACK": acknowledges receipt of a data chunk during streaming, can include info on how many bytes received so far
+        """
         if "OK HASH" in line.upper():
             digest = self._extract_digest(line)
+            # If digest is complete in this line, set response. 
             if digest:
                 self.last_response = {"type": "hash", "data": digest}
                 self.response_event.set()
                 self.awaiting_response = False
                 self.pending_digest_chars = ""
+            # Otherwise, enter accumulation mode to gather subsequent lines until we have the full digest.
             else:
                 self.awaiting_response = True
                 self._accumulate_digest_chars(line)
         elif line.startswith("OK MODE "):
+            # Echo of the mode that was set.
             self.last_response = {"type": "mode", "data": line[len("OK MODE "):].strip()}
             self.response_event.set()
             self.awaiting_response = False
         elif line.startswith("OK STATUS "):
+            # Echo of the current controller status in hex, also triggers update of live status display.
             status_hex = line[len("OK STATUS "):].strip()
             self.last_response = {"type": "status", "data": status_hex}
             self.response_event.set()
             self.awaiting_response = False
-            # Also update live status display
+            # Update live status display
             self.root.after(0, lambda s=status_hex: self._parse_and_display_status(s))
         elif line.startswith("OK PONG") or line.startswith("PONG"):
+            # Response to PING command.
             self.last_response = {"type": "pong", "data": True}
             self.response_event.set()
             self.awaiting_response = False
         elif line.startswith("OK ABORT"):
+            # Response to ABORT command, may include additional info about the abort reason or state.
             self.last_response = {"type": "abort", "data": line}
             self.response_event.set()
             self.awaiting_response = False
         elif line.startswith("OK LIMITS "):
-            self._parse_limits_response(line)
-            if self.protocol:
-                self.protocol.handle_limits_response(line)
+            # Response to LIMITS query, includes max chunk size.
+            self.protocol.handle_limits_response(line)
         elif line.startswith(RESP_STREAM_START):
+            # Indicates the controller is ready to receive a data stream (after MODE command).
             self.last_response = {"type": "stream_start", "data": line}
             self.response_event.set()
             self.awaiting_response = False
         elif line.startswith(RESP_DATASTR_ACK):
+            # Acknowledges receipt of a data chunk during streaming, can include info on how many bytes received so far.
             self.last_response = {"type": "datastr_ack", "data": line}
             self.response_event.set()
             self.awaiting_response = False
         elif line.startswith("ERR"):
+            # An error response from the controller.
             self.last_response = {"type": "error", "data": line}
             self.response_event.set()
             self.awaiting_response = False
         elif self.awaiting_response:
+            # If waiting for response, wait for incoming digest lines.
             self._accumulate_digest_chars(line)
         
-        # Let protocol handler also process for synchronous operations
+        # Pass the line to the protocol handler for any additional internal processing or state updates.
         if self.protocol:
             self.protocol.handle_response_line(line)
             
@@ -556,144 +515,31 @@ class Sha3StressTest:
         """Get expected digest length based on current mode."""
         mode_lengths = {"224": 56, "256": 64, "384": 96, "512": 128}
         return mode_lengths.get(self.current_mode, 64)
-    
-    def _extract_digest(self, line: str) -> Optional[str]:
-        """Extract digest from response line."""
-        expected_len = self._expected_digest_len()
-        
-        up = line.upper()
-        if "OK HASH" in up:
-            idx = up.find("OK HASH")
-            tail = line[idx + len("OK HASH"):]
-        else:
-            tail = line
-        
-        hex_only = "".join(ch for ch in tail.lower() if ch in "0123456789abcdef")
-        if len(hex_only) >= expected_len:
-            return hex_only[:expected_len]
-        
-        m = re.search(rf"([0-9a-fA-F]{{{expected_len}}})", line)
-        if m:
-            return m.group(1).lower()
-        
-        return None
-    
-    def _accumulate_digest_chars(self, line: str) -> None:
-        """Accumulate digest characters from fragmented responses."""
-        expected_len = self._expected_digest_len()
-        
-        up = line.upper()
-        if "OK HASH" in up:
-            idx = up.find("OK HASH")
-            line = line[idx + len("OK HASH"):]
-        
-        token_matches = re.findall(r"[0-9a-fA-F]+", line)
-        if not token_matches:
-            return
-        
-        token = max(token_matches, key=len).lower()
-        if len(token) < 8:
-            return
-        
-        self.pending_digest_chars += token
-        if len(self.pending_digest_chars) > expected_len * 2:
-            self.pending_digest_chars = self.pending_digest_chars[-expected_len * 2:]
-    
-    def _send_line(self, cmd: str) -> None:
-        """Send a command to the FPGA."""
-        if not self.ser or not self.protocol:
-            raise RuntimeError("Not connected to serial port")
-        self.protocol.send_line(cmd)
 
-    def _query_limits(self) -> None:
-        """Query firmware for UART command buffer limits and negotiate max chunk size."""
-        def limits_worker():
+    def _prepare_response_wait(self, timeout: float) -> None:
+        """Prepare local RX state before waiting on ProtocolHandler response event."""
+        self.response_event.clear()
+        self.last_response = None
+        self.awaiting_response = True
+        self.response_deadline = time.time() + timeout
+        self.pending_digest_chars = ""
+
+        if self.ser:
             try:
-                self.waiting_limits_response = True
-                self.limits_event.clear()
-                self._send_line("LIMITS")
-                
-                # Wait for response with timeout
-                if not self.limits_event.wait(timeout=2.0):
-                    self.root.after(0, lambda: self._log_uart("[sys] LIMITS query timeout; using default max", "sys"))
-                    self.negotiated_max_chunk = MAX_CHUNK_SIZE
-            except Exception as exc:
-                self.root.after(0, lambda e=exc: self._log_uart(f"[sys] LIMITS query failed: {e}; using default", "sys"))
-                self.negotiated_max_chunk = MAX_CHUNK_SIZE
-            finally:
-                self.waiting_limits_response = False
-        
-        threading.Thread(target=limits_worker, daemon=True).start()
+                self.ser.reset_input_buffer()
+            except Exception:
+                pass
 
-    def _parse_limits_response(self, line: str) -> None:
-        """Parse 'OK LIMITS uart_cmd_max=N datastr_payload_max=M' and compute negotiated limit."""
         try:
-            datastr_match = re.search(r'datastr_payload_max=(\d+)', line)
-            uart_match = re.search(r'uart_cmd_max=(\d+)', line)
-
-            if datastr_match:
-                negotiated = int(datastr_match.group(1))
-            elif uart_match:
-                uart_cmd_max = int(uart_match.group(1))
-                negotiated = compute_max_chunk_size(uart_cmd_max)
-            else:
-                negotiated = None
-
-            if negotiated is not None:
-                self.negotiated_max_chunk = negotiated
-                self._log_uart(f"[sys] LIMITS negotiated: chunk_max={negotiated}", "sys")
-                
-                # Update UI to show max chunk size
-                self.root.after(0, lambda: self.max_chunk_label.config(text=f"(max: {negotiated})"))
-                
-                if self.waiting_limits_response:
-                    self.limits_event.set()
-            else:
-                self._log_uart("[sys] LIMITS response format unrecognized; using default", "sys")
-                self.negotiated_max_chunk = MAX_CHUNK_SIZE
-                self.root.after(0, lambda: self.max_chunk_label.config(text=f"(max: {MAX_CHUNK_SIZE})"))
-        except Exception as exc:
-            self._log_uart(f"[sys] Failed to parse LIMITS: {exc}; using default", "sys")
-            self.negotiated_max_chunk = MAX_CHUNK_SIZE
-            self.root.after(0, lambda: self.max_chunk_label.config(text=f"(max: {MAX_CHUNK_SIZE})"))
-
-    def _effective_chunk_size(self) -> int:
-        try:
-            chunk_size = int(self.chunk_size_var.get())
+            self.rx_partial.clear()
         except Exception:
-            chunk_size = DEFAULT_CHUNK_SIZE
+            pass
 
-        if chunk_size < MIN_CHUNK_SIZE:
-            chunk_size = DEFAULT_CHUNK_SIZE
-
-        # Clamp to negotiated firmware limit (if available)
-        if self.negotiated_max_chunk is not None:
-            if chunk_size > self.negotiated_max_chunk:
-                self._log_uart(
-                    f"[sys] chunk_size={chunk_size} exceeds negotiated max={self.negotiated_max_chunk}; clamping",
-                    "sys",
-                )
-                chunk_size = self.negotiated_max_chunk
-        else:
-            # Fallback to fixed max if LIMITS not negotiated
-            if chunk_size > self.max_datastr_payload_chars:
-                self._log_uart(
-                    f"[sys] chunk_size={chunk_size} exceeds datastr_max={self.max_datastr_payload_chars}; clamping",
-                    "sys",
-                )
-                chunk_size = self.max_datastr_payload_chars
-
-        if chunk_size < MIN_CHUNK_SIZE:
-            chunk_size = MIN_CHUNK_SIZE
-        return chunk_size
-
-    def _chunk_step_max(self) -> int:
-        """Return highest power-of-two selectable size (one step above clamp limit)."""
-        max_limit = self.negotiated_max_chunk
-        if max_limit is None:
-            max_limit = self.max_datastr_payload_chars
-        max_limit = max(max_limit, MIN_CHUNK_SIZE)
-        return 1 << max_limit.bit_length()
+        while True:
+            try:
+                self.rx_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _set_bytes_progress(self, sent: int, total: int) -> None:
         """Update bytes sent progress in the UI."""
@@ -701,38 +547,9 @@ class Sha3StressTest:
         self.bytes_total = max(0, total)
         self.bytes_progress_var.set(f"{self.bytes_sent} / {self.bytes_total} bytes")
 
-    def _chunk_size_step_up(self) -> None:
-        """Increase chunk size to next power of two within negotiated limits."""
-        try:
-            value = int(self.chunk_size_var.get())
-        except Exception:
-            value = DEFAULT_CHUNK_SIZE
-
-        value = max(value, MIN_CHUNK_SIZE)
-        is_power_of_two = value > 0 and (value & (value - 1) == 0)
-        next_value = value * 2 if is_power_of_two else (1 << value.bit_length())
-        next_value = min(next_value, self._chunk_step_max())
-        self.chunk_size_var.set(str(max(next_value, MIN_CHUNK_SIZE)))
-
-    def _chunk_size_step_down(self) -> None:
-        """Decrease chunk size to previous power of two within negotiated limits."""
-        try:
-            value = int(self.chunk_size_var.get())
-        except Exception:
-            value = DEFAULT_CHUNK_SIZE
-
-        value = max(value, MIN_CHUNK_SIZE)
-        if value <= MIN_CHUNK_SIZE:
-            self.chunk_size_var.set(str(MIN_CHUNK_SIZE))
-            return
-
-        is_power_of_two = value > 0 and (value & (value - 1) == 0)
-        next_value = value // 2 if is_power_of_two else (1 << (value.bit_length() - 1))
-        self.chunk_size_var.set(str(max(next_value, MIN_CHUNK_SIZE)))
-    
     def _send_ping(self) -> None:
         """Send a PING command manually."""
-        if not self.ser:
+        if not self.ser or not self.protocol:
             messagebox.showerror("Ping", "Not connected to serial port")
             return
         if self.test_running:
@@ -743,17 +560,23 @@ class Sha3StressTest:
             self.status_var.set("Waiting for PING ACK...")
 
             def ping_worker() -> None:
-                ok = self._wait_for_response(lambda: self._send_line("PING"), 1.5)
+                if not self.protocol:
+                    self.root.after(0, lambda: self._log_result("PING failed: protocol not initialized", "fail"))
+                    self.root.after(0, lambda: self.status_var.set("PING failed"))
+                    return
+
+                self._prepare_response_wait(1.5)
+                ok = self.protocol.wait_for_response(lambda: self.protocol.send_line("PING"), timeout=1.5)
                 if not ok:
                     self.root.after(0, lambda: self._log_result("PING timeout (no ACK)", "fail"))
                     self.root.after(0, lambda: self.status_var.set("PING timeout"))
                     return
 
-                if self.last_response and self.last_response.get("type") == "pong":
+                if self.protocol.last_response and self.protocol.last_response.get("type") == "pong":
                     self.root.after(0, lambda: self._log_result("PING ACK received (OK PONG)", "pass"))
                     self.root.after(0, lambda: self.status_var.set("PING acknowledged by FPGA"))
                 else:
-                    detail = self.last_response["data"] if self.last_response else "unexpected response"
+                    detail = self.protocol.last_response["data"] if self.protocol.last_response else "unexpected response"
                     self.root.after(0, lambda d=detail: self._log_result(f"PING failed: {d}", "fail"))
                     self.root.after(0, lambda: self.status_var.set("PING failed"))
 
@@ -763,22 +586,22 @@ class Sha3StressTest:
     
     def _query_status_manual(self) -> None:
         """Query status manually."""
-        if not self.ser:
+        if not self.ser or not self.protocol:
             messagebox.showerror("Status", "Not connected to serial port")
             return
         try:
-            self._send_line("STATUS")
+            self.protocol.send_line("STATUS")
             self._log_result("Querying controller status...", "header")
         except Exception as exc:
             messagebox.showerror("Status", f"Failed to query status:\n{exc}")
 
     def _abort_manual(self) -> None:
         """Send ABORT command manually to recover from lockups."""
-        if not self.ser:
+        if not self.ser or not self.protocol:
             messagebox.showerror("Abort", "Not connected to serial port")
             return
         try:
-            self._send_line(CMD_ABORT)
+            self.protocol.send_line(CMD_ABORT)
             self._log_result("Manual ABORT sent", "header")
             self._log_uart("[sys] Manual ABORT sent", "sys")
             if self.test_running:
@@ -789,82 +612,6 @@ class Sha3StressTest:
                     self.abort_notice_logged = True
         except Exception as exc:
             messagebox.showerror("Abort", f"Failed to send ABORT:\n{exc}")
-    
-    def _parse_and_display_status(self, status_line: str) -> None:
-        """Parse STATUS register hex value and update individual flag indicators."""
-        try:
-            # Extract status=0x... from response line
-            # Format: "mode=256 status=0x13 idle=1 done=0 in_full=0 err=0x0"
-            match = re.search(r'status=(0x[0-9a-fA-F]+)', status_line)
-            if not match:
-                # Try parsing whole string as hex (fallback)
-                status_hex = status_line.strip().lower()
-                if status_hex.startswith("0x"):
-                    status_hex = status_hex[2:]
-                status_val = int(status_hex, 16)
-            else:
-                status_hex = match.group(1)
-                status_val = int(status_hex, 16)
-
-            # Update raw display for parity with UART GUI
-            self.status_raw_var.set(status_line.strip())
-            
-            # Parse individual bits based on README register map
-            # Bit 0: IDLE
-            idle = bool(status_val & (1 << 0))
-            self.status_idle.config(fg="green" if idle else "gray")
-            
-            # Bit 1: BUSY
-            busy = bool(status_val & (1 << 1))
-            self.status_busy.config(fg="orange" if busy else "gray")
-            
-            # Bit 2: DONE
-            done = bool(status_val & (1 << 2))
-            self.status_done.config(fg="blue" if done else "gray")
-            
-            # Bit 4: IN_EMPTY
-            in_empty = bool(status_val & (1 << 4))
-            self.status_in_empty.config(fg="cyan" if in_empty else "gray")
-            
-            # Bit 5: IN_FULL
-            in_full = bool(status_val & (1 << 5))
-            self.status_in_full.config(fg="red" if in_full else "gray")
-            
-            # Bit 6: OUT_EMPTY
-            out_empty = bool(status_val & (1 << 6))
-            self.status_out_empty.config(fg="cyan" if out_empty else "gray")
-            
-            # Bit 7: OUT_FULL
-            out_full = bool(status_val & (1 << 7))
-            self.status_out_full.config(fg="red" if out_full else "gray")
-            
-            # Bit 8: ERR_ILL (illegal write)
-            err_ill = bool(status_val & (1 << 8))
-            self.status_err_ill.config(fg="red" if err_ill else "gray")
-            
-            # Bit 9: ERR_UF (underflow)
-            err_uf = bool(status_val & (1 << 9))
-            self.status_err_uf.config(fg="red" if err_uf else "gray")
-            
-            # Bit 10: ERR_OF (overflow)
-            err_of = bool(status_val & (1 << 10))
-            self.status_err_of.config(fg="red" if err_of else "gray")
-            
-        except (ValueError, IndexError):
-            self.status_raw_var.set("Parse error")
-    
-    def _compute_expected_digest(self, mode: str, msg: str) -> str:
-        """Compute expected digest for comparison."""
-        payload = msg.encode("utf-8")
-        if mode == "224":
-            return hashlib.sha3_224(payload).hexdigest()
-        if mode == "256":
-            return hashlib.sha3_256(payload).hexdigest()
-        if mode == "384":
-            return hashlib.sha3_384(payload).hexdigest()
-        if mode == "512":
-            return hashlib.sha3_512(payload).hexdigest()
-        raise ValueError(f"Unsupported mode: {mode}")
     
     def _generate_random_message(self, size: int) -> str:
         """Generate a random message of specified size."""
@@ -877,9 +624,11 @@ class Sha3StressTest:
             messagebox.showerror("Test", "Connect to serial port first")
             return
         
+        # Check if a test is already running to prevent multiple concurrent tests.
         if self.test_running:
             return
         
+        # Validate test parameters before starting.
         try:
             start_size = int(self.start_size_var.get())
             end_size = int(self.end_size_var.get())
@@ -893,6 +642,7 @@ class Sha3StressTest:
             messagebox.showerror("Test", "Invalid test parameters")
             return
         
+        # Initialize test state and start background thread to run tests.
         self.test_running = True
         self.abort_notice_logged = False
         self.test_stop_event.clear()
@@ -915,7 +665,8 @@ class Sha3StressTest:
                 self._log_result("[ABORT] Test run aborted by user", "abort")
                 self.abort_notice_logged = True
             try:
-                self._send_line(CMD_ABORT)
+                if self.protocol:
+                    self.protocol.send_line(CMD_ABORT)
                 self._log_uart("[sys] ABORT sent", "sys")
             except Exception as exc:
                 self._log_uart(f"[sys] ABORT send failed: {exc}", "uart_error")
@@ -961,7 +712,12 @@ class Sha3StressTest:
                 
                 # Set mode on device
                 self.root.after(0, lambda m=mode: self.status_var.set(f"Setting mode to SHA3-{m}..."))
-                if not self._wait_for_response(lambda: self._send_line(f"MODE {mode}"), timeout):
+                if not self.protocol:
+                    self._log_result("Protocol handler not initialized", "fail")
+                    continue
+
+                self._prepare_response_wait(timeout)
+                if not self.protocol.wait_for_response(lambda m=mode: self.protocol.send_line(f"MODE {m}"), timeout=timeout):
                     self._log_result(f"Failed to set mode {mode}", "fail")
                     continue
                 
@@ -1120,36 +876,6 @@ class Sha3StressTest:
         except Exception as exc:
             return False, str(exc), "", 0.0
     
-    def _wait_for_response(self, send_func, timeout: float) -> bool:
-        """Wait for a response from the device."""
-        self.response_event.clear()
-        self.last_response = None
-        self.awaiting_response = True
-        self.response_deadline = time.time() + timeout
-        self.pending_digest_chars = ""
-        # Flush any pending input that could contaminate the next response
-        if self.ser:
-            try:
-                # pyserial: discard any received bytes in the OS/kernel buffer
-                self.ser.reset_input_buffer()
-            except Exception:
-                pass
-
-        # Clear any partially-accumulated data in our local buffers/queues
-        try:
-            self.rx_partial.clear()
-        except Exception:
-            pass
-        while True:
-            try:
-                self.rx_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        send_func()
-
-        return self.response_event.wait(timeout + 0.5)
-    
     def _display_result(self, result: TestResult) -> None:
         """Display a test result."""
         if result.aborted:
@@ -1261,24 +987,15 @@ class Sha3StressTest:
         self.status_var.set("Idle")
         self._set_bytes_progress(0, 0)
     
-    def _on_close(self) -> None:
-        """Handle window close event."""
+    def _before_close(self) -> bool:
+        """Handle pre-close checks and teardown for active stress test."""
         if self.test_running:
             if not messagebox.askyesno("Exit", "Test is running. Stop and exit?"):
-                return
+                return False
             self.test_stop_event.set()
             if self.test_thread:
                 self.test_thread.join(timeout=1.0)
-        
-        if self.poll_after_id is not None:
-            try:
-                self.root.after_cancel(self.poll_after_id)
-            except Exception:
-                pass
-        
-        self._disconnect()
-        self.root.quit()
-        self.root.destroy()
+        return True
 
 
 def main() -> None:

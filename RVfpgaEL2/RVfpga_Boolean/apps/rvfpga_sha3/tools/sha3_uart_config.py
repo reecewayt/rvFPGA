@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
-"""Shared UART/SHA3 protocol configuration for host tools."""
+"""
+sha3_uart_config.py - Shared UART/SHA3 host-tool configuration constants.
+
+    Authors: Copilot and Truong Le (tnl3@pdx.edu)
+
+How this config module is used:
+- Imported by GUI, stress test, and protocol modules to keep protocol tokens,
+    defaults, and UI sizing values consistent.
+- Provides command/response identifiers used for command assembly and parsing.
+- Defines stream-mode defaults and host-side chunk constraints.
+
+Commonly adjusted options:
+- DEFAULT_BAUD: serial speed used at connect time.
+- DEFAULT_STREAM_MODE: initial stream transport (line/binary).
+- DEFAULT_CHUNK_SIZE: initial payload chunk size for DATASTR sends.
+- MIN_CHUNK_SIZE/MAX_CHUNK_SIZE: host clamp bounds for chunk entry.
+- Font constants (DEFAULT_FONT_SIZE, STATUS_DOT_FONT_SIZE,
+    DEFAULT_LOG_FONT_SIZE): GUI readability tuning.
+
+Helper function:
+- compute_max_chunk_size(uart_cmd_max): computes safe DATASTR payload budget
+    from firmware uart command buffer constraints.
+    
+Note: This code was generated using Copilot using prompting.
+    
+"""
 
 # Common serial defaults
 DEFAULT_BAUD = 115200
